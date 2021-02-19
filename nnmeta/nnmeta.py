@@ -1,6 +1,7 @@
 # Base
 from dataclasses import dataclass, field
 import os, sys, shutil
+from re import DEBUG
 import numpy as np
 sys.path.insert(0, os.path.expanduser("~/") + "bin")  # Plotter...
 #
@@ -25,7 +26,7 @@ else:    print_function = print
 
 @dataclass
 class NNClass:
-    __version__ = "1.4.2"
+    __version__ = "1.4.5"
 
     internal_name  : str    = "[NNClass]"
     system_path    : str    = "."
@@ -44,14 +45,20 @@ class NNClass:
     redo_split_file      : bool   = False
     foreign_plotted      : bool   = False
     loss_tradeoff        : tuple  = (0.2, 0.8, 0.5)
-    n_interactions       : int    = 1
     lr                   : float  = 1e-4
+    predict_each_epoch   : int    = 10
+
     batch_size           : int    = 16
     n_features           : int    = 128
     n_filters            : int    = 128
     n_gaussians          : int    = 25
+    n_interactions       : int    = 1
     cutoff               : int    = 5.0  # angstrems
-    predict_each_epoch   : int    = 10
+
+    n_layers_energy_force   : int  = 2
+    n_layers_dipole_moment  : int  = 2
+    n_neurons_energy_force  : int  = None
+    n_neurons_dipole_moment : int  = None
 
     #
     using_matplotlib             : bool = False
@@ -99,23 +106,34 @@ class NNClass:
 
         if not self.using_matplotlib and self.plot_enabled:
              self.plotter_progress = Plotter(title="Check Results", pages_info=dict(
-                 xyz_file    =dict(xname="[DFT steps]", yname="Energy [Hartree]",),
-                 xyz_file_sub=dict(xname="[DFT steps]", yname="Energy-(int)E[0], [Hartree]",),
-                 energy_mae  =dict(xname="Time [s]"   , yname="Energy MAE [Hartree]",),
-                 forces_mae  =dict(xname="Time [s]"   , yname="Forces MAE [Hartree/\u212B]",),
-                 e_diff      =dict(xname="[DFT steps]", yname="\\Delta Energy [Hartree]",),
+                 xyz_file     = dict(xname="[DFT steps]", yname="Energy [Hartree]",),
+                 xyz_file_sub = dict(xname="[DFT steps]", yname="Energy-(int)E[0], [Hartree]",),
+                 energy_mae   = dict(xname="Time [s]"   , yname="Energy MAE [Hartree]",),
+                 forces_mae   = dict(xname="Time [s]"   , yname="Forces MAE [Hartree/\u212B]",),
+                 e_diff       = dict(xname="[DFT steps]", yname="\\Delta Energy [Hartree]",),
         ))
         # info
-        self.db_epochs            = self.info[self.network_name]
-        self.n_features           = self.info[self.network_name+"_features"]["n_features"]
-        self.predict_each_epoch   = self.info[self.network_name+"_features"]["predict_each_epoch"]
-        self.n_interactions       = self.info[self.network_name+"_features"]["n_interactions"]
-        self.batch_size           = self.info[self.network_name+"_features"]["batch_size"]
-        self.lr                   = self.info[self.network_name+"_features"]["lr"]
-        self.n_gaussians          = self.info[self.network_name+"_features"]["n_gaussians"]
-        self.db_properties        = self.info[self.network_name+"_features"]["db_properties"]
-        self.training_properties  = self.info[self.network_name+"_features"]["training_properties"]
-        self.loss_tradeoff        = self.info[self.network_name+"_features"]["loss_tradeoff"]
+        kf = self.network_name+"_features"
+        self.db_epochs               = self.info[self.network_name]
+        self.predict_each_epoch      = self.info[kf].get("predict_each_epoch")      if self.info[kf].get("predict_each_epoch")      else self.predict_each_epoch
+        self.lr                      = self.info[kf].get("lr")                      if self.info[kf].get("lr")                      else self.lr
+        self.batch_size              = self.info[kf].get("batch_size")              if self.info[kf].get("batch_size")              else self.batch_size
+
+        self.n_features              = self.info[kf].get("n_features")              if self.info[kf].get("n_features")              else self.n_features
+        self.n_filters               = self.info[kf].get("n_filters")               if self.info[kf].get("n_filters")               else self.n_filters
+        self.n_interactions          = self.info[kf].get("n_interactions")          if self.info[kf].get("n_interactions")          else self.n_interactions
+        self.n_gaussians             = self.info[kf].get("n_gaussians")             if self.info[kf].get("n_gaussians")             else self.n_gaussians
+        self.cutoff                  = self.info[kf].get("cutoff")                  if self.info[kf].get("cutoff")                  else self.cutoff
+
+        self.db_properties           = self.info[kf].get("db_properties")           if self.info[kf].get("db_properties")           else self.db_properties
+        self.training_properties     = self.info[kf].get("training_properties")     if self.info[kf].get("training_properties")     else self.training_properties
+        self.loss_tradeoff           = self.info[kf].get("loss_tradeoff")           if self.info[kf].get("loss_tradeoff")           else self.loss_tradeoff
+
+        self.n_layers_energy_force   = self.info[kf].get("n_layers_energy_force")   if self.info[kf].get("n_layers_energy_force")   else self.n_layers_energy_force
+        self.n_neurons_energy_force  = self.info[kf].get("n_neurons_energy_force")  if self.info[kf].get("n_neurons_energy_force")  else self.n_neurons_energy_force
+
+        self.n_layers_dipole_moment  = self.info[kf].get("n_layers_dipole_moment")  if self.info[kf].get("n_layers_dipole_moment")  else self.n_layers_dipole_moment
+        self.n_neurons_dipole_moment = self.info[kf].get("n_neurons_dipole_moment") if self.info[kf].get("n_neurons_dipole_moment") else self.n_neurons_dipole_moment
 
         print(self.internal_name,  self.__version__, "System path:", self.system_path )
 
@@ -265,11 +283,11 @@ class NNClass:
                     except Exception as e: print("[Warning]", e)
                 if 'forces' in self.db_properties:
                     try:
-                        forces = np.array([sample.get_forces()],   dtype=np.float32); _['forces'] = forces
+                        forces = np.array(sample.get_forces(),   dtype=np.float32); _['forces'] = forces
                     except Exception as e: print("[Warning]", e)
-                if 'dipole_moments' in self.db_properties:
+                if 'dipole_moment' in self.db_properties:
                     try:
-                        dipole_moment = np.array([sample.get_dipole_moment()], dtype=np.float32); _['dipole_moment'] = dipole_moment
+                        dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float32); _['dipole_moment'] = dipole_moment
                     except Exception as e: print("[Warning]", e)
                 property_list.append(_)
 
@@ -352,14 +370,9 @@ class NNClass:
                 cutoff_network       = spk.nn.cutoff.CosineCutoff,
                 )
 
-            # TODO think about it
-            # properties = ["energy", "forces"]  # properties used for training
-            # atomrefs = self.samples.get_atomref(properties)
-            # print("Atomrefs:", atomrefs)
-
             if "energy" in self.training_properties or "forces" in self.training_properties:
 
-                per_atom = dict(energy=True, forces=False)
+                per_atom = dict(energy=True, forces=False, dipole_moment=False)
                 means, stddevs = self.train_loader.get_statistics(property_names  = list(self.training_properties),
                                                                   divide_by_atoms = per_atom,
                                                                   single_atom_ref = None)
@@ -370,8 +383,8 @@ class NNClass:
                     n_in             = representation.n_atom_basis,
                     n_out            = 1,                            # 1    -- default
                     aggregation_mode = "sum",                        # sum  -- default
-                    n_layers         = 5,                            # 2    -- default
-                    n_neurons        = None,                         # None -- default
+                    n_layers         = self.n_layers_energy_force,   # 2    -- default
+                    n_neurons        = self.n_neurons_energy_force,  # None -- default
                     property         = "energy",
                     derivative       = "forces",
                     mean             = means  ["energy"],
@@ -384,8 +397,9 @@ class NNClass:
 
                 DIPOLE_MOMENT = spk.atomistic.DipoleMoment(
                     n_in              = representation.n_atom_basis,
-                    n_layers          = 10,                            # 2 -- default
-                    n_neurons         = None,                         # None -- default
+                    n_out             = 1,
+                    n_layers          = self.n_layers_dipole_moment,  # 2 -- default
+                    n_neurons         = self.n_neurons_dipole_moment, # None -- default
                     activation        = schnetpack.nn.activations.shifted_softplus,
                     property          = "dipole_moment",
                     contributions     = None,
@@ -520,7 +534,6 @@ class NNClass:
         - epochs_done [None] -- int used in plotting (optional)
         - path2foreign_model [None]  -- if set used for comparing
         """
-
         if path2foreign_model is not None:
             if not self.foreign_plotted: self.foreign_plotted = True
             network_name = key_prefix = "foreign_model"
@@ -614,13 +627,14 @@ class NNClass:
 
             if "forces" in self.training_properties:
                 # calculate absolute error of forces, where we compute the mean over the n_atoms x 3 dimensions
-                tmp_forces    = torch.mean( torch.mean(torch.abs(pred["forces"] - batch["forces"]), dim=(0,1)) , dim=(0) )
+                tmp_forces = torch.mean ( torch.mean(torch.abs(pred["forces"] - batch["forces"]), dim=(0)) , dim=(0,) )
+                #tmp_forces  = torch.mean( torch.mean(torch.abs(pred["forces"] - batch["forces"]), dim=(0,1)) , dim=(0) )
                 tmp_forces    = tmp_forces.detach().cpu().numpy() # detach from graph & convert to numpy
                 forces_error += tmp_forces
 
             if "dipole_moment" in self.training_properties:
                 # calculate absolute error of dipole_moment vector mean: n_atoms x 3 dimensions
-                tmp_dipole_moment = torch.mean(torch.abs(pred["dipole_moment"] - batch["dipole_moment"]), dim=(0,1))
+                tmp_dipole_moment = torch.mean(torch.abs(pred["dipole_moment"] - batch["dipole_moment"]), dim=(0,))
                 tmp_dipole_moment = tmp_dipole_moment.detach().cpu().numpy()
                 dipole_moment_error += tmp_dipole_moment
 
@@ -629,7 +643,7 @@ class NNClass:
         dipole_moment_error /= len(self.test_samples)
 
         print('\nTest MAE:')
-        print('         energy: {:10.5f} Hartree'.format(energy_error))
+        print('       <energy>: {:10.5f} Hartree'.format(energy_error))
         print('       <forces>: {} Hartree/\u212B'.format(forces_error))
         print('<dipole moment>: {} Debye'.format(dipole_moment_error))
 
