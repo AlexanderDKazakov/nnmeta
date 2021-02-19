@@ -26,7 +26,7 @@ else:    print_function = print
 
 @dataclass
 class NNClass:
-    __version__ = "1.4.5"
+    __version__ = "1.4.6"
 
     internal_name  : str    = "[NNClass]"
     system_path    : str    = "."
@@ -449,7 +449,7 @@ class NNClass:
 
             if epoch <= epochs_done: continue
             else:
-                if epoch % self.predict_each_epoch == 0:
+                if epoch % self.predict_each_epoch == 0 and epoch != 0:
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
                     self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
                     self.use_model_on_test(db_name=indexes)
