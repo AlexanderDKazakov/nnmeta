@@ -1,9 +1,7 @@
 # Base
 from dataclasses import dataclass, field
 import os, sys, shutil
-from re import DEBUG
 import numpy as np
-sys.path.insert(0, os.path.expanduser("~/") + "bin")  # Plotter...
 #
 from ase.io    import read, write
 import torch
@@ -12,7 +10,7 @@ import schnetpack.atomistic.model
 from schnetpack import AtomsData
 from schnetpack.train.metrics import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
 from schnetpack.train         import Trainer, CSVHook, ReduceLROnPlateauHook
-from schnetpack.train import build_mse_loss
+from schnetpack.train         import build_mse_loss
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -26,11 +24,13 @@ else:    print_function = print
 
 @dataclass
 class NNClass:
-    __version__ = "1.4.6"
+    __version__ = "1.4.7"
+    debug          : bool = False
 
     internal_name  : str    = "[NNClass]"
     system_path    : str    = "."
-    plot_enabled   : bool   = True
+    plot_enabled   : bool   = False
+    meta           : bool   = True
     storer         : object = None
     device         : str    = "cuda" if torch.cuda.is_available() else "cpu"
     network_name   : str    = "unknower"
@@ -97,6 +97,7 @@ class NNClass:
 
         if self.plot_enabled:
             try:
+                sys.path.insert(0, os.path.expanduser("~/") + "bin")  # Plotter...
                 from Plotter import Plotter
                 self.using_matplotlib = False
             except:
@@ -114,6 +115,17 @@ class NNClass:
         ))
         # info
         kf = self.network_name+"_features"
+        try:
+            db_epochs = self.info[self.network_name]
+        except KeyError:
+            available_nns = []
+            for k in self.info: 
+                if not str(k).endswith("_features"): available_nns.append(k)
+
+            print(f"There is no information about [{self.network_name}] network in `info`")
+            print(f"Known NN: {available_nns}")
+            sys.exit(1)
+
         self.db_epochs               = self.info[self.network_name]
         self.predict_each_epoch      = self.info[kf].get("predict_each_epoch")      if self.info[kf].get("predict_each_epoch")      else self.predict_each_epoch
         self.lr                      = self.info[kf].get("lr")                      if self.info[kf].get("lr")                      else self.lr
@@ -135,7 +147,21 @@ class NNClass:
         self.n_layers_dipole_moment  = self.info[kf].get("n_layers_dipole_moment")  if self.info[kf].get("n_layers_dipole_moment")  else self.n_layers_dipole_moment
         self.n_neurons_dipole_moment = self.info[kf].get("n_neurons_dipole_moment") if self.info[kf].get("n_neurons_dipole_moment") else self.n_neurons_dipole_moment
 
+        self.number_training_examples_percent   = self.info[kf].get("number_training_examples_percent")   if self.info[kf].get("number_training_examples_percent")   else self.number_training_examples_percent
+        self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent") if self.info[kf].get("number_validation_examples_percent") else self.number_validation_examples_percent
+
+        self.check_provided_parameters()
         print(self.internal_name,  self.__version__, "System path:", self.system_path )
+
+        if self.debug: print("<<<Debug call>>>\n", str(self)); sys.exit(0)
+    
+
+    def check_provided_parameters(self):
+        ok = True; mess = ""
+        if (self.number_training_examples_percent + self.number_validation_examples_percent) >= 100:
+            ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
+        
+        if not ok: print(mess); sys.exit(1)
 
     @staticmethod
     def loss_function(batch, result):
@@ -534,67 +560,75 @@ class NNClass:
         - epochs_done [None] -- int used in plotting (optional)
         - path2foreign_model [None]  -- if set used for comparing
         """
-        if path2foreign_model is not None:
-            if not self.foreign_plotted: self.foreign_plotted = True
-            network_name = key_prefix = "foreign_model"
-            model_path   = path2foreign_model
-            fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
-            epochs_done  = "[UNKNOWN]"
+        if 'dipole_moment' in self.training_properties or self.meta:
+            """
+            * No prodiction for dipole moment yet.
+            * No need to predict anything on the remote job
+            """
+            return
         else:
-            network_name = key_prefix = str(self.network_name)
-            model_path   = self.model_path
-            fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
-        print(self.internal_name, "Prediction check ["+network_name+"]")
-        step = None
-        try:    start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
-        except: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
-        print(f"Region of interest: [start:{start_region_of_interest}|end:{end_region_of_interest}|step:{step}]")
-        print(f"Visualization of each {self.visualize_each_point_from_nn}th sample...")
+            if path2foreign_model is not None:
+                if not self.foreign_plotted: self.foreign_plotted = True
+                network_name = key_prefix = "foreign_model"
+                model_path   = path2foreign_model
+                fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
+                epochs_done  = "[UNKNOWN]"
+            else:
+                network_name = key_prefix = str(self.network_name)
+                model_path   = self.model_path
+                fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
-        # creating folder for model test
-        test_path = os.path.join(self.test_path, network_name); os.makedirs(test_path, exist_ok=True)
-        fname     = os.path.join(test_path, fname_name)
+            print(self.internal_name, "Prediction check ["+network_name+"]")
+            step = None
+            try:    start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
+            except: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
+            print(f"Region of interest: [start:{start_region_of_interest}|end:{end_region_of_interest}|step:{step}]")
+            print(f"Visualization of each {self.visualize_each_point_from_nn}th sample...")
 
-        if not os.path.exists(fname):
-            initial_predicted_energy = []
+            # creating folder for model test
+            test_path = os.path.join(self.test_path, network_name); os.makedirs(test_path, exist_ok=True)
+            fname     = os.path.join(test_path, fname_name)
 
-            print_function("Reading " + str(xyz_file) + "...")
-            samples = read(self.xyz_path + xyz_file, index=indexes, format="extxyz")
-            num_samples = len(samples)
-            print("Num samples:", num_samples)
+            if not os.path.exists(fname):
+                initial_predicted_energy = []
 
-            print_function("["+str(network_name) + "] Loading the last best model")
-            best_model = torch.load(os.path.join(model_path, 'best_model'))
+                print_function("Reading " + str(xyz_file) + "...")
+                samples = read(self.xyz_path + xyz_file, index=indexes, format="extxyz")
+                num_samples = len(samples)
+                print("Num samples:", num_samples)
 
-            calc = spk.interfaces.SpkCalculator(
-                    model=best_model,
-                    device=self.device,
-                    energy='energy',
-                    forces='forces',
-                    environment_provider=spk.environment.AseEnvironmentProvider(6.)
-                    )
+                print_function("["+str(network_name) + "] Loading the last best model")
+                best_model = torch.load(os.path.join(model_path, 'best_model'))
 
-            print_function("Predicting...")
-            for idx_sample in tqdm(range(0,num_samples,self.visualize_each_point_from_nn)):
-                sample = samples[idx_sample]
-                if 'energy'        in self.training_properties: true_energy = sample.get_potential_energy()
-                if 'dipole_moment' in self.training_properties: true_dipole = sample.get_dipole_moment()
-                sample.set_calculator(calc)
-                initial_predicted_energy.append( (true_energy, sample.get_potential_energy()) )
-            np.savetxt(fname, X=np.array(initial_predicted_energy))
+                calc = spk.interfaces.SpkCalculator(
+                        model=best_model,
+                        device=self.device,
+                        energy='energy',
+                        forces='forces',
+                        environment_provider=spk.environment.AseEnvironmentProvider(6.)
+                        )
 
-        initial_predicted_energy = np.loadtxt(fname)
-        # Plotting
-        y      = initial_predicted_energy[:,1]  # take predicted energy
-        y_diff = initial_predicted_energy[:, 0] - initial_predicted_energy[:,1]  # 'correct' - predicted energies
-        x      = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, len(y)-2 )]
+                print_function("Predicting...")
+                for idx_sample in tqdm(range(0,num_samples,self.visualize_each_point_from_nn)):
+                    sample = samples[idx_sample]
+                    if 'energy'        in self.training_properties: true_energy = sample.get_potential_energy()
+                    if 'dipole_moment' in self.training_properties: true_dipole = sample.get_dipole_moment()
+                    sample.set_calculator(calc)
+                    initial_predicted_energy.append( (true_energy, sample.get_potential_energy()) )
+                np.savetxt(fname, X=np.array(initial_predicted_energy))
 
-        if not self.using_matplotlib and self.plot_enabled:
-            key_name = key_prefix+" epoch:"+str(epochs_done) + " predicted:" + str(len(y))
-            self.plotter_progress.plot(x=x, y=y,        key_name=key_name, page="xyz_file")
-            self.plotter_progress.plot(x=x, y=(y-y[0]), key_name=key_name, page="xyz_file_sub")
-            self.plotter_progress.plot(x=x, y=y_diff,   key_name=key_name, page="e_diff")
+            initial_predicted_energy = np.loadtxt(fname)
+            # Plotting
+            y      = initial_predicted_energy[:,1]  # take predicted energy
+            y_diff = initial_predicted_energy[:, 0] - initial_predicted_energy[:,1]  # 'correct' - predicted energies
+            x      = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, len(y)-2 )]
+
+            if not self.using_matplotlib and self.plot_enabled:
+                key_name = key_prefix+" epoch:"+str(epochs_done) + " predicted:" + str(len(y))
+                self.plotter_progress.plot(x=x, y=y,        key_name=key_name, page="xyz_file")
+                self.plotter_progress.plot(x=x, y=(y-y[0]), key_name=key_name, page="xyz_file_sub")
+                self.plotter_progress.plot(x=x, y=y_diff,   key_name=key_name, page="e_diff")
 
     def use_model_on_test(self, db_name=None, path2model=None,):
         """
