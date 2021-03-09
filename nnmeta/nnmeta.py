@@ -24,7 +24,7 @@ else:    print_function = print
 
 @dataclass
 class NNClass:
-    __version__ = "1.4.7"
+    __version__ = "1.4.8"
     debug          : bool = False
 
     internal_name  : str    = "[NNClass]"
@@ -53,7 +53,7 @@ class NNClass:
     n_filters            : int    = 128
     n_gaussians          : int    = 25
     n_interactions       : int    = 1
-    cutoff               : int    = 5.0  # angstrems
+    cutoff               : int    = 5.0  # angstroms
 
     n_layers_energy_force   : int  = 2
     n_layers_dipole_moment  : int  = 2
@@ -119,7 +119,7 @@ class NNClass:
             db_epochs = self.info[self.network_name]
         except KeyError:
             available_nns = []
-            for k in self.info: 
+            for k in self.info:
                 if not str(k).endswith("_features"): available_nns.append(k)
 
             print(f"There is no information about [{self.network_name}] network in `info`")
@@ -154,13 +154,13 @@ class NNClass:
         print(self.internal_name,  self.__version__, "System path:", self.system_path )
 
         if self.debug: print("<<<Debug call>>>\n", str(self)); sys.exit(0)
-    
+
 
     def check_provided_parameters(self):
         ok = True; mess = ""
         if (self.number_training_examples_percent + self.number_validation_examples_percent) >= 100:
             ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
-        
+
         if not ok: print(mess); sys.exit(1)
 
     @staticmethod
