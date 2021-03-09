@@ -114,14 +114,14 @@ class NNClass:
                  forces_mae   = dict(xname="Time [s]"   , yname="Forces MAE [Hartree/\u212B]",),
                  e_diff       = dict(xname="[DFT steps]", yname="\\Delta Energy [Hartree]",),
         ))
-        
+
         # info
         kf = self.network_name+"_features"
         try:
             db_epochs = self.info[self.network_name]
         except KeyError:
             available_nns = []
-            for k in self.info: 
+            for k in self.info:
                 if not str(k).endswith("_features"): available_nns.append(k)
 
             print(f"There is no information about [{self.network_name}] network in `info`")
@@ -155,7 +155,7 @@ class NNClass:
         self.check_provided_parameters()
         print(f"{self.internal_name} [v.{self.__version__}] | System path: {self.system_path}")
         if self.debug: print("<<<Debug call>>>\n", str(self)); sys.exit(0)
-    
+
 
     def check_provided_parameters(self) -> None:
         ok = True; mess = ""
@@ -163,7 +163,7 @@ class NNClass:
         if (self.number_training_examples_percent + self.number_validation_examples_percent) >= 100:
             ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
         # 2...
-        
+
         if not ok: print(mess); sys.exit(1)
 
     @staticmethod
@@ -194,8 +194,8 @@ class NNClass:
         return db_list
 
     def print_info(self) -> None:
-        print(f""" 
-'# # # # # # # # # # # [INFORMATION | device {self.device}:{list(range(torch.cuda.device_count()))}] # # # # # # # # # # #'
+        print(f"""
+# # # # # # # # # # # [INFORMATION | device {self.device}:{list(range(torch.cuda.device_count()))}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
         LEARNING RATE                :   {self.lr}
@@ -212,7 +212,7 @@ class NNClass:
             DB                       :   {self.db_path}
             MODEL [GENERAL]          :   {self.general_models_path}
             SPLITS                   :   {self.split_path}
-              
+
         """)
         self.storer.show()
 
@@ -240,7 +240,7 @@ class NNClass:
         self.storer  = Storer(dump_name=self.network_name, dump_path=self.model_path, compressed=False, verbose=True)
 
     def plot_training_progress(self) -> None:
-        # TODO: REFACTORING 
+        # TODO: REFACTORING
         #
         with open(os.path.join(self.model_path, 'log.csv')) as flog: head = [next(flog) for line in range(1)]
         titles = head[0].strip().lower().split(",")
@@ -684,10 +684,10 @@ class NNClass:
         print(f"""
 
 Test MAE:
-    <energy> [Hartree]        : {energy_error}
-    <forces> [Hartree/\u212B] : {forces_error}
-    <dipole moment> [Debye]   : {dipole_moment_error}
-         
+          <energy> [Hartree]          : {energy_error}
+          <forces> [Hartree/angstrom] : {forces_error}
+          <dipole moment> [Debye]     : {dipole_moment_error}
+
         """)
 
     def prepare_network(self, redo:bool = False) -> None:
