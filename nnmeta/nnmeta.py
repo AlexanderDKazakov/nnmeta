@@ -102,7 +102,7 @@ class NNClass:
                 from Plotter import Plotter
                 self.using_matplotlib = False
             except:
-                print("Sorry. Plotter is not available. Matplotlib will be in use...")
+                print_function(f"Sorry. Plotter is not available. Matplotlib will be in use...")
                 import matplotlib.pyplot as plt
                 self.using_matplotlib = True
 
@@ -124,8 +124,8 @@ class NNClass:
             for k in self.info:
                 if not str(k).endswith("_features"): available_nns.append(k)
 
-            print(f"There is no information about [{self.network_name}] network in `info`")
-            print(f"Known NN: {available_nns}")
+            print_function(f"There is no information about [{self.network_name}] network in `info`")
+            print_function(f"Known NN: {available_nns}")
             sys.exit(1)
 
         self.db_epochs               = self.info[self.network_name]
@@ -153,8 +153,8 @@ class NNClass:
         self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent") if self.info[kf].get("number_validation_examples_percent") else self.number_validation_examples_percent
 
         self.check_provided_parameters()
-        print(f"{self.internal_name} [v.{self.__version__}] | System path: {self.system_path}")
-        if self.debug: print("<<<Debug call>>>\n", str(self)); sys.exit(0)
+        print_function(f"{self.internal_name} [v.{self.__version__}] | System path: {self.system_path}")
+        if self.debug: print_function(f"<<<Debug call>>>\n {str(self)}"); sys.exit(0)
 
 
     def check_provided_parameters(self) -> None:
@@ -164,7 +164,7 @@ class NNClass:
             ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
         # 2...
 
-        if not ok: print(mess); sys.exit(1)
+        if not ok: print_function(mess); sys.exit(1)
 
     @staticmethod
     def loss_function(batch: Any, result: Any) -> Tensor:
@@ -189,12 +189,12 @@ class NNClass:
         for db_file in os.listdir(db_path):
             if db_file.endswith(".db"):
                 db_fname = os.fsdecode(db_file)
-                print(f"     Found: {db_fname}")
+                print_function(f"     Found: {db_fname}")
                 db_list.append(db_fname)
         return db_list
 
     def print_info(self) -> None:
-        print(f"""
+        print_function(f"""
 # # # # # # # # # # # [INFORMATION | device {self.device}:{list(range(torch.cuda.device_count()))}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
@@ -222,7 +222,7 @@ class NNClass:
         if redo:
             ans = input("Are you sure with removing the trained model? [y/n]\n")
             if ans == "y":
-                print(
+                print_function(
                     """
                     REMOVING THE PREVIOUS MODEL (IF EXIST) + TEST_FOLDER
 
@@ -234,10 +234,10 @@ class NNClass:
                 try: shutil.rmtree(self.test_path + self.network_name)
                 except FileNotFoundError: pass
             else:
-                print("Skipping removing...")
+                print_function(f"Skipping removing...")
 
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        self.storer  = Storer(dump_name=self.network_name, dump_path=self.model_path, compressed=False, verbose=True)
+        self.storer  = Storer(dump_name=self.network_name, dump_path=self.model_path, compressed=False)
 
     def plot_training_progress(self) -> None:
         # TODO: REFACTORING
@@ -252,18 +252,18 @@ class NNClass:
 
         # Determine time axis
         time = results[:,0]-results[0,0]
-        print("Time:", time)
+        print_function(f"Time: {time}")
         time_ = self.training_progress['time'] - self.training_progress['time'][0]
-        print("Time_:", time_)
+        print_function(f"Time_: {time_}")
 
         # Load the validation MAEs
         if 'energy' in self.training_properties: energy_mae = self.training_progress['mae_energy']
         if 'forces' in self.training_properties: forces_mae = self.training_progress['mae_forces']
 
         # Get final validation errors
-        print('Validation MAE:')
-        print('    energy: {:10.5f} Hartree'.format(energy_mae[-1]))
-        print('    forces: {:10.5f} Hartree/\u212B'.format(forces_mae[-1]))
+        print_function('Validation MAE:')
+        print_function('    energy: {:10.5f} Hartree'.format(energy_mae[-1]))
+        print_function('    forces: {:10.5f} Hartree/\u212B'.format(forces_mae[-1]))
 
         if not self.using_matplotlib:
             self.plotter_progress.plot(x=time, y=energy_mae, key_name="", page="energy_mae")
@@ -291,18 +291,18 @@ class NNClass:
         # recreating databases
         if redo:
             db_list = NNClass.find_dbs(db_path=self.db_path)
-            print(f"{self.internal_name} [Re-creating databases...]")
+            print_function(f"{self.internal_name} [Re-creating databases...]")
             for db_fname in db_list:
                 os.remove(self.db_path + db_fname)
-                print(f"     {db_fname} removed.")
+                print_function(f"     {db_fname} removed.")
 
-        print(f"{self.internal_name} Checking databases...")
+        print_function(f"{self.internal_name} Checking databases...")
         db_path_fname = os.path.join(self.db_path, xyz_file + "_"+ str(index) + ".db")
-        if os.path.exists(db_path_fname): print(f" - - -> {index} [OK]")
+        if os.path.exists(db_path_fname): print_function(f" - - -> {index} [OK]")
         else:
             # no databases is found
-            print(self.internal_name, "Preparing databases...")
-            print(f"Creating db with indexes: {index}")
+            print_function(f"{self.internal_name} Preparing databases...")
+            print_function(f"Creating db with indexes: {index}")
             property_list = []
             samples = read(self.xyz_path + xyz_file, index=index, format="extxyz")
             for sample in tqdm(samples):
@@ -314,34 +314,34 @@ class NNClass:
                 if 'energy' in self.db_properties:
                     try:
                         energy = np.array([sample.info['energy']], dtype=np.float32); _['energy'] = energy
-                    except Exception as e: print("[Warning]", e)
+                    except Exception as e: print_function(f"[Warning]: {e}")
                 if 'forces' in self.db_properties:
                     try:
                         forces = np.array(sample.get_forces(),   dtype=np.float32); _['forces'] = forces
-                    except Exception as e: print("[Warning]", e)
+                    except Exception as e: print_function(f"[Warning]: {e}")
                 if 'dipole_moment' in self.db_properties:
                     try:
                         dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float32); _['dipole_moment'] = dipole_moment
-                    except Exception as e: print("[Warning]", e)
+                    except Exception as e: print_function(f"[Warning]: {e}")
                 property_list.append(_)
 
             # Creating DB
             new_dataset = AtomsData(db_path_fname, available_properties=self.db_properties)
             new_dataset.add_systems(samples, property_list)
 
-            print(f"Creating databases for {self.xyz_path} is done!")
+            print_function(f"Creating databases for {self.xyz_path} is done!")
 
     def prepare_train_valid_test_samples(self, db_name:str = "xyzname.xyz_indexes.db") -> None:
-        print(f"{self.internal_name} Preparing train/valid/test samples...")
+        print_function(f"{self.internal_name} Preparing train/valid/test samples...")
 
         # loading db
         db_path_fname = self.db_path + db_name
-        print(f"Loading... | {db_path_fname}")
+        print_function(f"Loading... | {db_path_fname}")
         self.samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
 
         # take first atoms/props
         atoms, props = self.samples.get_properties(idx=0)
-        print(f"->>> 1 sample[{atoms.symbols}]")
+        print_function(f"->>> 1 sample[{atoms.symbols}]")
         print('->>> [DB] Properties:\n', *[' -- {:s}\n'.format(key) for key in props.keys()])
 
         number_training_examples   = int(len(self.samples) * (self.number_training_examples_percent   / 100))
@@ -352,7 +352,7 @@ class NNClass:
 
         # removing if redo
         if self.redo_split_file:
-            print(f"{self.internal_name} [Recreating split.npz]")
+            print_function(f"{self.internal_name} [Recreating split.npz]")
             try: os.remove(self.split_path_file)
             except FileNotFoundError: pass
 
@@ -364,25 +364,25 @@ class NNClass:
             split_file = self.split_path_file,  # WARNING! if the file exists it will be loaded.
         )
 
-        print(f"{self.internal_name} Creating train/validation/test loader...")
+        print_function(f"{self.internal_name} Creating train/validation/test loader...")
         # PIN MEMORY <-?-> Savage of memory?
         self.train_loader = AtomsLoader(self.train_samples, batch_size=self.batch_size, num_workers=4, pin_memory=False, shuffle=True,)
         self.valid_loader = AtomsLoader(self.valid_samples, batch_size=self.batch_size, num_workers=4, pin_memory=False)
         self.test_loader  = AtomsLoader(self.test_samples,  batch_size=self.batch_size, num_workers=4, pin_memory=False)
 
-        print(f"{self.internal_name} [train/valid/test] done.")
+        print_function(f"{self.internal_name} [train/valid/test] done.")
 
     def build_model(self) -> None:
-        print(f"{self.internal_name} Checking the model...")
+        print_function(f"{self.internal_name} Checking the model...")
         if os.path.exists(self.model_path + "/best_model"):
-            print(self.internal_name, "Already trained network exists!")
-            print("Loading...")
+            print_function(f"{self.internal_name} Already trained network exists!")
+            print_function(f"Loading...")
             self.model = torch.load(self.model_path + "/best_model")
-            print("Model parameters:", self.model)
+            print_function(f"Model parameters: {self.model}")
 
         else:
-            print("[WARNING] No neural network!")
-            print(f"{self.internal_name} Building the model...")
+            print_function(f"[WARNING] No neural network!")
+            print_function(f"{self.internal_name} Building the model...")
             output_modules = []
 
             representation = spk.SchNet(
@@ -405,8 +405,8 @@ class NNClass:
                 means, stddevs = self.train_loader.get_statistics(property_names  = list(self.training_properties),
                                                                   divide_by_atoms = per_atom,
                                                                   single_atom_ref = None)
-                print('Mean atomization energy      / atom: {:12.4f} [Hartree]'.format(means  ["energy"][0]))
-                print('Std. dev. atomization energy / atom: {:12.4f} [Hartree]'.format(stddevs["energy"][0]))
+                print_function('Mean atomization energy      / atom: {:12.4f} [Hartree]'.format(means  ["energy"][0]))
+                print_function('Std. dev. atomization energy / atom: {:12.4f} [Hartree]'.format(stddevs["energy"][0]))
 
                 ENERGY_FORCE = spk.atomistic.Atomwise(
                     n_in             = representation.n_atom_basis,
@@ -426,10 +426,10 @@ class NNClass:
 
                 DIPOLE_MOMENT = spk.atomistic.DipoleMoment(
                     n_in              = representation.n_atom_basis,
-                    n_out             = 1,
+                    n_out             = 3,
                     n_layers          = self.n_layers_dipole_moment,  # 2 -- default
                     n_neurons         = self.n_neurons_dipole_moment, # None -- default
-                    activation        = schnetpack.nn.activations.shifted_softplus,
+                    activation        = spk.nn.activations.shifted_softplus,
                     property          = "dipole_moment",
                     contributions     = None,
                     predict_magnitude = False,
@@ -438,13 +438,13 @@ class NNClass:
                 )
                 output_modules.append(DIPOLE_MOMENT)
 
-            print(f"Output_modules [{len(output_modules)}]: {output_modules}")
+            print_function(f"Output_modules [{len(output_modules)}]: {output_modules}")
 
             self.model = AtomisticModel(representation, output_modules)
-            print(f"Model parameters: {self.model}")
+            print_function(f"Model parameters: {self.model}")
 
             self.model = torch.nn.DataParallel(self.model)
-            print(f"{self.internal_name} [model building] done.")
+            print_function(f"{self.internal_name} [model building] done.")
 
 
     def build_trainer(self) -> None:
@@ -471,33 +471,33 @@ class NNClass:
             validation_loader = self.valid_loader,
         )
 
-    def _train(self, epochs:int = None, name4storer:str = None, indexes:str = None, xyz_file:str = None) -> None:
-        print(f"{self.internal_name} Training...")
+    def _train(self, epochs:int = None, indexes:str = None, xyz_file:str = None) -> None:
+        print_function(f"{self.internal_name} Training...")
 
-        for epoch in tqdm(range(epochs)):
-            epochs_done = self.storer.get(name4storer)
+        for epoch in tqdm(range(epochs), file=sys.stdout):
+            epochs_done = self.storer.get(self.name4storer)
 
             if epoch <= epochs_done: continue
             else:
-                if epoch % self.predict_each_epoch == 0 and epoch != 0:
-                    if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
-                    self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
-                    self.use_model_on_test(db_name=indexes)
-
                 # Training
                 self.trainer.train(device=self.device, n_epochs=1)
                 if epoch > 1 and self.plot_enabled: self.plot_training_progress()
 
                 # Storing checkpoint
-                self.storer.put(what=epochs_done+1, name=name4storer)
+                self.storer.put(what=epochs_done+1, name=self.name4storer)
                 self.storer.dump()
+
+                if epoch % self.predict_each_epoch == 0 and epoch != 0:
+                    if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
+                    self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
+                    self.use_model_on_test(db_name=indexes)
 
         # Show the last epoch
         self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
-        print(f"{self.internal_name} [model training] done.")
+        print_function(f"{self.internal_name} [model training] done.")
 
     def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
-        print(self.internal_name, "Visualizing regions of interest...")
+        print_function(f"{self.internal_name} Visualizing regions of interest...")
         # visualization whole range of points
         if xyz_file:
             self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
@@ -510,7 +510,7 @@ class NNClass:
         num_samples = len(source_of_points)
 
         if samples4showing > num_samples:
-            print(f"Warning! You requested samples for showing: {samples4showing}, however available only {num_samples}.")
+            print_function(f"Warning! You requested samples for showing: {samples4showing}, however available only {num_samples}.")
             samples4showing = num_samples
 
         # choose number of points from the train data of region of interest
@@ -532,9 +532,9 @@ class NNClass:
         """
 
         for xyz_file in self.db_epochs:
-            print(f"XYZ data: {xyz_file}")
+            print_function(f"XYZ data: {xyz_file}")
             for indexes, epochs in self.db_epochs[xyz_file].items():
-                print(f"Indexes: {indexes}")
+                print_function(f"Indexes: {indexes}")
                 self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
                 self.prepare_train_valid_test_samples(db_name = xyz_file+"_"+indexes+".db")
                 if self.plot_enabled: self.visualize_interest_region(indexes=indexes, samples4showing=self.visualize_points_from_data, source_of_points=self.train_samples)
@@ -545,13 +545,13 @@ class NNClass:
                 # initial preparations
                 self.build_trainer()
                 #
-                name4storer = self.network_name +"_"+xyz_file+"_"+indexes+".nn"
-                if not self.storer.get(name4storer): self.storer.put(what=0, name=name4storer)
-                print(f"--> [Storer]  epochs done: {self.storer.show(get_string=True)}")
-                print(f"--> [Trainer] epochs done: {self.trainer.epoch}")
+                self.name4storer = self.network_name +"_"+xyz_file+"_"+indexes+".nn"
+                if not self.storer.get(self.name4storer): self.storer.put(what=0, name=self.name4storer)
+                print_function(f"--> [Storer]  epochs done: {self.storer.show(get_string=True)}")
+                print_function(f"--> [Trainer] epochs done: {self.trainer.epoch}")
 
                 #
-                self._train(epochs=epochs, name4storer=name4storer, indexes=indexes, xyz_file=xyz_file)
+                self._train(epochs=epochs, indexes=indexes, xyz_file=xyz_file)
                 self.use_model_on_test(db_name=indexes)
 
     def predict(self, indexes:str  = None, xyz_file:str = None, epochs_done:int = None, path2foreign_model:str = None) -> None:
@@ -583,12 +583,12 @@ class NNClass:
                 model_path   = self.model_path
                 fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
-            print(self.internal_name, "Prediction check ["+network_name+"]")
+            print_function(f"{self.internal_name} Prediction check [{network_name}]")
             step = None
             try:    start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
             except: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
-            print(f"Region of interest: [start:{start_region_of_interest}|end:{end_region_of_interest}|step:{step}]")
-            print(f"Visualization of each {self.visualize_each_point_from_nn}th sample...")
+            print_function(f"Region of interest: [start:{start_region_of_interest}|end:{end_region_of_interest}|step:{step}]")
+            print_function(f"Visualization of each {self.visualize_each_point_from_nn}th sample...")
 
             # creating folder for model test
             test_path = os.path.join(self.test_path, network_name); os.makedirs(test_path, exist_ok=True)
@@ -597,12 +597,12 @@ class NNClass:
             if not os.path.exists(fname):
                 initial_predicted_energy = []
 
-                print_function("Reading " + str(xyz_file) + "...")
+                print_function(f"Reading {xyz_file}...")
                 samples = read(self.xyz_path + xyz_file, index=indexes, format="extxyz")
                 num_samples = len(samples)
-                print("Num samples:", num_samples)
+                print_function(f"Num samples: {num_samples}")
 
-                print_function("["+str(network_name) + "] Loading the last best model")
+                print_function(f"[{network_name}] Loading the last best model")
                 best_model = torch.load(os.path.join(model_path, 'best_model'))
 
                 calc = spk.interfaces.SpkCalculator(
@@ -613,7 +613,7 @@ class NNClass:
                         environment_provider=spk.environment.AseEnvironmentProvider(6.)
                         )
 
-                print_function("Predicting...")
+                print_function(f"Predicting...")
                 for idx_sample in tqdm(range(0,num_samples,self.visualize_each_point_from_nn)):
                     sample = samples[idx_sample]
                     if 'energy'        in self.training_properties: true_energy = sample.get_potential_energy()
@@ -643,14 +643,15 @@ class NNClass:
         which = "trained" if path2model is None else "[FOREIGN]"
         if path2model is None: best_model = torch.load(os.path.join(self.model_path, 'best_model'))
         else:                  best_model = torch.load(os.path.join(path2model,      'best_model'))
-        print(f"{self.internal_name} Using the {which} model on the test data...")
+        #print_function(f"{self.internal_name} Using the {which} model on the test data...")
 
         energy_error, forces_error, dipole_moment_error  = 0.0, torch.Tensor([.0, .0, .0]), torch.Tensor([.0, .0, .0])
 
         if self.test_loader is None: self.prepare_train_valid_test_samples(db_name=db_name)
 
-        # for count, batch in enumerate(self.test_loader):
-        for batch in tqdm(self.test_loader):
+        samples_to_account = 0
+        for _, batch in enumerate(self.test_loader):
+            samples_to_account += len(batch['dipole_moment'])
             # move batch to GPU, if necessary
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
@@ -679,11 +680,12 @@ class NNClass:
         # division by number of samples
         energy_error        /= len(self.test_samples)
         forces_error        /= len(self.test_samples)
-        dipole_moment_error /= len(self.test_samples)
+        #dipole_moment_error /= len(self.test_samples)
+        dipole_moment_error /= samples_to_account
 
-        print(f"""
+        print_function(f"""
 
-Test MAE:
+Test MAE | epochs {self.storer.get(self.name4storer)}:
           <energy> [Hartree]          : {energy_error}
           <forces> [Hartree/angstrom] : {forces_error}
           <dipole moment> [Debye]     : {dipole_moment_error}
