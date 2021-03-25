@@ -402,11 +402,19 @@ class NNClass:
             if "energy" in self.training_properties or "forces" in self.training_properties:
 
                 per_atom = dict(energy=True, forces=False, dipole_moment=False)
-                means, stddevs = self.train_loader.get_statistics(property_names  = list(self.training_properties),
+                try:
+                    means, stddevs = self.train_loader.get_statistics(property_names  = list(self.training_properties),
                                                                   divide_by_atoms = per_atom,
                                                                   single_atom_ref = None)
-                print_function('Mean atomization energy      / atom: {:12.4f} [Hartree]'.format(means  ["energy"][0]))
-                print_function('Std. dev. atomization energy / atom: {:12.4f} [Hartree]'.format(stddevs["energy"][0]))
+                    print_function('Mean atomization energy      / atom: {:12.4f} [Hartree]'.format(means  ["energy"][0]))
+                    print_function('Std. dev. atomization energy / atom: {:12.4f} [Hartree]'.format(stddevs["energy"][0]))
+                    means_energy  = means  ["energy"]
+                    stddevs_enegy = stddevs["energy"]
+                except:
+                    # Not consistent data
+                    print("[NOTE] Provided samples are not consistent!")
+                    means_energy  = None
+                    stddevs_enegy = None
 
                 ENERGY_FORCE = spk.atomistic.Atomwise(
                     n_in             = representation.n_atom_basis,
@@ -416,8 +424,8 @@ class NNClass:
                     n_neurons        = self.n_neurons_energy_force,  # None -- default
                     property         = "energy",
                     derivative       = "forces",
-                    mean             = means  ["energy"],
-                    stddev           = stddevs["energy"],
+                    mean             = means_energy,
+                    stddev           = stddevs_enegy,
                     negative_dr      = True,
                 )
                 output_modules.append(ENERGY_FORCE)
@@ -426,7 +434,6 @@ class NNClass:
 
                 DIPOLE_MOMENT = spk.atomistic.DipoleMoment(
                     n_in              = representation.n_atom_basis,
-                    n_out             = 3,
                     n_layers          = self.n_layers_dipole_moment,  # 2 -- default
                     n_neurons         = self.n_neurons_dipole_moment, # None -- default
                     activation        = spk.nn.activations.shifted_softplus,
@@ -649,9 +656,13 @@ class NNClass:
 
         if self.test_loader is None: self.prepare_train_valid_test_samples(db_name=db_name)
 
+        if "energy"        in self.training_properties: batch_name = "energy"
+        if "dipole_moment" in self.training_properties: batch_name = "dipole_moment"
+
         samples_to_account = 0
         for _, batch in enumerate(self.test_loader):
-            samples_to_account += len(batch['dipole_moment'])
+
+            samples_to_account += len(batch[batch_name])
             # move batch to GPU, if necessary
             batch = {k: v.to(self.device) for k, v in batch.items()}
 
@@ -667,7 +678,6 @@ class NNClass:
             if "forces" in self.training_properties:
                 # calculate absolute error of forces, where we compute the mean over the n_atoms x 3 dimensions
                 tmp_forces = torch.mean ( torch.mean(torch.abs(pred["forces"] - batch["forces"]), dim=(0)) , dim=(0,) )
-                #tmp_forces  = torch.mean( torch.mean(torch.abs(pred["forces"] - batch["forces"]), dim=(0,1)) , dim=(0) )
                 tmp_forces    = tmp_forces.detach().cpu().numpy() # detach from graph & convert to numpy
                 forces_error += tmp_forces
 
@@ -678,9 +688,8 @@ class NNClass:
                 dipole_moment_error += tmp_dipole_moment
 
         # division by number of samples
-        energy_error        /= len(self.test_samples)
-        forces_error        /= len(self.test_samples)
-        #dipole_moment_error /= len(self.test_samples)
+        energy_error        /= samples_to_account
+        forces_error        /= samples_to_account
         dipole_moment_error /= samples_to_account
 
         print_function(f"""
