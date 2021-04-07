@@ -26,7 +26,7 @@ else:    print_function = print
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.4.8"
+    __version__                  : str            = "1.4.9"
     debug                        : bool           = False
 
     internal_name                : str            = "[NNClass]"
@@ -81,6 +81,13 @@ class NNClass:
     number_training_examples_percent  : float     = 60.0
     number_validation_examples_percent: float     = 20.0
 
+    units_dimensions = dict(
+        ENERGY        = "Hartree",
+        FORCE         = "Hartree/Bohr",
+        DIPOLE_MOMENT = "Debye"
+    )
+    check_list_files = {}
+
     def __post_init__(self):
         if self.system_path[-1] != "/": self.system_path+="/"
         #
@@ -96,25 +103,6 @@ class NNClass:
         os.makedirs(os.path.dirname(self.split_path),          exist_ok=True)
         os.makedirs(os.path.dirname(self.test_path),           exist_ok=True)
 
-        if self.plot_enabled:
-            try:
-                sys.path.insert(0, os.path.expanduser("~/") + "bin")  # Plotter...
-                from Plotter import Plotter
-                self.using_matplotlib = False
-            except:
-                print_function(f"Sorry. Plotter is not available. Matplotlib will be in use...")
-                import matplotlib.pyplot as plt
-                self.using_matplotlib = True
-
-        if not self.using_matplotlib and self.plot_enabled:
-             self.plotter_progress = Plotter(title="Check Results", pages_info=dict(
-                 xyz_file     = dict(xname="[DFT steps]", yname="Energy [Hartree]",),
-                 xyz_file_sub = dict(xname="[DFT steps]", yname="Energy-(int)E[0], [Hartree]",),
-                 energy_mae   = dict(xname="Time [s]"   , yname="Energy MAE [Hartree]",),
-                 forces_mae   = dict(xname="Time [s]"   , yname="Forces MAE [Hartree/\u212B]",),
-                 e_diff       = dict(xname="[DFT steps]", yname="\\Delta Energy [Hartree]",),
-        ))
-
         # info
         kf = self.network_name+"_features"
         try:
@@ -125,36 +113,57 @@ class NNClass:
                 if not str(k).endswith("_features"): available_nns.append(k)
 
             print_function(f"There is no information about [{self.network_name}] network in `info`")
-            print_function(f"Known NN: {available_nns}")
+            print_function(f"Known NNs: {available_nns}")
             sys.exit(1)
 
-        self.db_epochs               = self.info[self.network_name]
-        self.predict_each_epoch      = self.info[kf].get("predict_each_epoch")      if self.info[kf].get("predict_each_epoch")      else self.predict_each_epoch
-        self.lr                      = self.info[kf].get("lr")                      if self.info[kf].get("lr")                      else self.lr
-        self.batch_size              = self.info[kf].get("batch_size")              if self.info[kf].get("batch_size")              else self.batch_size
+        self.db_epochs = self.info[self.network_name]
+        if self.info[kf].get("predict_each_epoch"):                 self.predict_each_epoch                 = self.info[kf].get("predict_each_epoch")
+        if self.info[kf].get("lr"):                                 self.lr                                 = self.info[kf].get("lr")
+        if self.info[kf].get("batch_size"):                         self.batch_size                         = self.info[kf].get("batch_size")
+        if self.info[kf].get("n_features"):                         self.n_features                         = self.info[kf].get("n_features")
+        if self.info[kf].get("n_filters"):                          self.n_filters                          = self.info[kf].get("n_filters")
+        if self.info[kf].get("n_interactions"):                     self.n_interactions                     = self.info[kf].get("n_interactions")
+        if self.info[kf].get("n_gaussians"):                        self.n_gaussians                        = self.info[kf].get("n_gaussians")
+        if self.info[kf].get("cutoff"):                             self.cutoff                             = self.info[kf].get("cutoff")
+        if self.info[kf].get("db_properties"):                      self.db_properties                      = self.info[kf].get("db_properties")
+        if self.info[kf].get("training_properties"):                self.training_properties                = self.info[kf].get("training_properties")
+        if self.info[kf].get("loss_tradeoff"):                      self.loss_tradeoff                      = self.info[kf].get("loss_tradeoff")
 
-        self.n_features              = self.info[kf].get("n_features")              if self.info[kf].get("n_features")              else self.n_features
-        self.n_filters               = self.info[kf].get("n_filters")               if self.info[kf].get("n_filters")               else self.n_filters
-        self.n_interactions          = self.info[kf].get("n_interactions")          if self.info[kf].get("n_interactions")          else self.n_interactions
-        self.n_gaussians             = self.info[kf].get("n_gaussians")             if self.info[kf].get("n_gaussians")             else self.n_gaussians
-        self.cutoff                  = self.info[kf].get("cutoff")                  if self.info[kf].get("cutoff")                  else self.cutoff
+        if self.info[kf].get("n_layers_energy_force"):              self.n_layers_energy_force              = self.info[kf].get("n_layers_energy_force")
+        if self.info[kf].get("n_neurons_energy_force"):             self.n_neurons_energy_force             = self.info[kf].get("n_neurons_energy_force")
 
-        self.db_properties           = self.info[kf].get("db_properties")           if self.info[kf].get("db_properties")           else self.db_properties
-        self.training_properties     = self.info[kf].get("training_properties")     if self.info[kf].get("training_properties")     else self.training_properties
-        self.loss_tradeoff           = self.info[kf].get("loss_tradeoff")           if self.info[kf].get("loss_tradeoff")           else self.loss_tradeoff
+        if self.info[kf].get("n_layers_dipole_moment"):             self.n_layers_dipole_moment             = self.info[kf].get("n_layers_dipole_moment")
+        if self.info[kf].get("n_neurons_dipole_moment"):            self.n_neurons_dipole_moment            = self.info[kf].get("n_neurons_dipole_moment")
 
-        self.n_layers_energy_force   = self.info[kf].get("n_layers_energy_force")   if self.info[kf].get("n_layers_energy_force")   else self.n_layers_energy_force
-        self.n_neurons_energy_force  = self.info[kf].get("n_neurons_energy_force")  if self.info[kf].get("n_neurons_energy_force")  else self.n_neurons_energy_force
+        if self.info[kf].get("number_training_examples_percent"):   self.number_training_examples_percent   = self.info[kf].get("number_training_examples_percent")
+        if self.info[kf].get("number_validation_examples_percent"): self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent")
 
-        self.n_layers_dipole_moment  = self.info[kf].get("n_layers_dipole_moment")  if self.info[kf].get("n_layers_dipole_moment")  else self.n_layers_dipole_moment
-        self.n_neurons_dipole_moment = self.info[kf].get("n_neurons_dipole_moment") if self.info[kf].get("n_neurons_dipole_moment") else self.n_neurons_dipole_moment
-
-        self.number_training_examples_percent   = self.info[kf].get("number_training_examples_percent")   if self.info[kf].get("number_training_examples_percent")   else self.number_training_examples_percent
-        self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent") if self.info[kf].get("number_validation_examples_percent") else self.number_validation_examples_percent
+        if self.info[kf].get("units_dimensions"):                   self.units_dimensions                   = self.info[kf].get("units_dimensions")
+        if self.info[kf].get("check_list_files"):                   self.check_list_files                   = self.info[kf].get("check_list_files")
 
         self.check_provided_parameters()
         print_function(f"{self.internal_name} [v.{self.__version__}] | System path: {self.system_path}")
         if self.debug: print_function(f"<<<Debug call>>>\n {str(self)}"); sys.exit(0)
+
+        if self.plot_enabled:
+            try:
+                from vplotter import Plotter
+                self.using_matplotlib = False
+            except:
+                print_function(f"Sorry. Plotter is not available. Matplotlib will be in use...")
+                import matplotlib.pyplot as plt
+                self.using_matplotlib = True
+
+        if not self.using_matplotlib and self.plot_enabled:
+             self.plotter_progress = Plotter(title="Check Results", pages_info=dict(
+                 xyz_file             = dict(xname="[DFT steps]", yname=f"Energy [{self.units_dimensions['ENERGY']}]",),
+                 xyz_file_sub         = dict(xname="[DFT steps]", yname=f"Energy-(int)E[0], [{self.units_dimensions['ENERGY']}]",),
+                 energy_loss          = dict(xname="Time [s]"   , yname=f"Energy LOSS [{self.units_dimensions['ENERGY']}]",),
+                 forces_loss          = dict(xname="Time [s]"   , yname=f"Force  LOSS [{self.units_dimensions['FORCE']}]",),
+                 dipole_moment_loss   = dict(xname="Time [s]"   , yname=f"Dipole moment LOSS [{self.units_dimensions['DIPOLE_MOMENT']}]",),
+                 e_diff               = dict(xname="[DFT steps]", yname=f"\\Delta Energy [{self.units_dimensions['ENERGY']}]",),
+             ))
+             self.plotter_log = Plotter(title="", engine="gnuplot")
 
 
     def check_provided_parameters(self) -> None:
@@ -203,6 +212,10 @@ class NNClass:
         LOSS TRADEOFF                :   {self.loss_tradeoff}
         TRAINING PROPERTIES          :   {self.training_properties}
 
+        ENERGY UNITS                 :   [{self.units_dimensions["ENERGY"]}]
+        FORCE UNITS                  :   [{self.units_dimensions["FORCE"]}]
+        DIPOLE MOMENT UNITS          :   [{self.units_dimensions["DIPOLE_MOMENT"]}]
+
         DB INFO:
             PROPERTIES               :   {self.db_properties}
             [INDEXES : EPOCHS]       :   {self.db_epochs.items()}
@@ -220,7 +233,7 @@ class NNClass:
         self.model_path   = self.general_models_path + self.network_name
 
         if redo:
-            ans = input("Are you sure with removing the trained model? [y/n]\n")
+            ans = input("Are you sure with removing the trained model? [y/N]\n")
             if ans == "y":
                 print_function(
                     """
@@ -240,8 +253,11 @@ class NNClass:
         self.storer  = Storer(dump_name=self.network_name, dump_path=self.model_path, compressed=False)
 
     def plot_training_progress(self) -> None:
-        # TODO: REFACTORING
-        #
+        """
+        Plotting the training progress by the framework.
+
+        """
+        energy_loss, forces_loss, dipole_moment_loss = None, None, None
         with open(os.path.join(self.model_path, 'log.csv')) as flog: head = [next(flog) for line in range(1)]
         titles = head[0].strip().lower().split(",")
         # Load logged results
@@ -252,39 +268,47 @@ class NNClass:
 
         # Determine time axis
         time = results[:,0]-results[0,0]
-        print_function(f"Time: {time}")
         time_ = self.training_progress['time'] - self.training_progress['time'][0]
-        print_function(f"Time_: {time_}")
 
         # Load the validation MAEs
-        if 'energy' in self.training_properties: energy_mae = self.training_progress['mae_energy']
-        if 'forces' in self.training_properties: forces_mae = self.training_progress['mae_forces']
+        if 'energy'        in self.training_properties: energy_loss        = self.training_progress['energy']
+        if 'forces'        in self.training_properties: forces_loss        = self.training_progress['forces']
+        if 'dipole_moment' in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment']
 
         # Get final validation errors
-        print_function('Validation MAE:')
-        print_function('    energy: {:10.5f} Hartree'.format(energy_mae[-1]))
-        print_function('    forces: {:10.5f} Hartree/\u212B'.format(forces_mae[-1]))
+        print_function(f"""
+
+Validation MAE | epochs {self.storer.get(self.name4storer)}:
+          <energy> [{self.units_dimensions['ENERGY']}]          : {energy_loss[-1]}
+          <forces> [{self.units_dimensions['FORCE']}] : {forces_loss[-1]}
+          <dipole moment> [{self.units_dimensions['DIPOLE_MOMENT']}]     : {dipole_moment_loss[-1]}
+
+        """)
+        #print_function('Validation MAE:')
+        #print_function('    energy: {:10.5f} Hartree'.format(energy_loss[-1]))
+        #print_function('    forces: {:10.5f} Hartree/\u212B'.format(forces_loss[-1]))
 
         if not self.using_matplotlib:
-            self.plotter_progress.plot(x=time, y=energy_mae, key_name="", page="energy_mae")
-            self.plotter_progress.plot(x=time, y=forces_mae, key_name="", page="forces_mae")
+            if 'energy'        in self.training_properties: self.plotter_progress.plot(x=time, y=energy_loss,        key_name="", page="energy_loss")
+            if 'forces'        in self.training_properties: self.plotter_progress.plot(x=time, y=forces_loss,        key_name="", page="forces_loss")
+            if 'dipole_moment' in self.training_properties: self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
         else:
             # Matplotlib instructions
             plt.figure(figsize=(14,5))
 
             # Plot energies
             plt.subplot(1,2,1)
-            plt.plot(time, energy_mae)
-            plt.title('Energy')
-            plt.ylabel('MAE [Hartree]')
-            plt.xlabel('Time [s]')
+            plt.plot(time, energy_loss)
+            plt.title("Energy")
+            plt.ylabel("Energy LOSS [{self.units_dimensions['ENERGY']}]")
+            plt.xlabel("Time [s]")
 
             # Plot forces
             plt.subplot(1,2,2)
-            plt.plot(time, forces_mae)
-            plt.title('Forces')
-            plt.ylabel('MAE [Hartree/\u212B]')
-            plt.xlabel('Time [s]')
+            plt.plot(time, forces_loss)
+            plt.title("Forces")
+            plt.ylabel("Force LOSS [{self.units_dimensions['FORCE']}]")
+            plt.xlabel("Time [s]")
             plt.show()
 
     def prepare_databases(self, redo:bool = False, index:str = "0:10:10", xyz_file:str = "noname.xyz") -> None:
@@ -406,8 +430,9 @@ class NNClass:
                     means, stddevs = self.train_loader.get_statistics(property_names  = list(self.training_properties),
                                                                   divide_by_atoms = per_atom,
                                                                   single_atom_ref = None)
-                    print_function('Mean atomization energy      / atom: {:12.4f} [Hartree]'.format(means  ["energy"][0]))
-                    print_function('Std. dev. atomization energy / atom: {:12.4f} [Hartree]'.format(stddevs["energy"][0]))
+                    ## [0] !?!
+                    print_function(f"Mean atomization energy      / atom: {means['energy']} [{self.units_dimensions['ENERGY']}]")
+                    print_function(f"Std. dev. atomization energy / atom: {stddevs['energy']} [{self.units_dimensions['ENERGY']}]")
                     means_energy  = means  ["energy"]
                     stddevs_enegy = stddevs["energy"]
                 except:
@@ -513,7 +538,10 @@ class NNClass:
         current_energy = []
 
         try:     start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
-        except:  start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
+        except:
+            try: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
+            except: start_region_of_interest, end_region_of_interest = 0, len(self.samples)
+
         num_samples = len(source_of_points)
 
         if samples4showing > num_samples:
@@ -525,7 +553,7 @@ class NNClass:
 
         for idx in idx_samples:
             _, props = source_of_points.get_properties(idx)
-            current_energy.append(props['energy'][0])
+            current_energy.append(props["energy"][0])
         y = np.array(current_energy)
         x = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, samples4showing)]
         if not self.using_matplotlib:
@@ -695,9 +723,9 @@ class NNClass:
         print_function(f"""
 
 Test MAE | epochs {self.storer.get(self.name4storer)}:
-          <energy> [Hartree]          : {energy_error}
-          <forces> [Hartree/angstrom] : {forces_error}
-          <dipole moment> [Debye]     : {dipole_moment_error}
+          <energy> [{self.units_dimensions["ENERGY"]}]          : {energy_error}
+          <forces> [{self.units_dimensions["FORCE"]}] : {forces_error}
+          <dipole moment> [{self.units_dimensions["DIPOLE_MOMENT"]}]     : {dipole_moment_error}
 
         """)
 
