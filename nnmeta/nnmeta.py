@@ -16,6 +16,7 @@ from schnetpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, 
 from schnetpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
 from schnetpack.train           import build_mse_loss
 from storer                     import Storer
+from collections                import defaultdict
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -26,7 +27,7 @@ else:    print_function = print
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.4.9"
+    __version__                  : str            = "1.5.2"
     debug                        : bool           = False
 
     internal_name                : str            = "[NNClass]"
@@ -48,6 +49,7 @@ class NNClass:
     loss_tradeoff                : tuple          = (0.2, 0.8, 0.5)
     lr                           : float          = 1e-4
     predict_each_epoch           : int            = 10
+    validate_each_epoch          : int            = 10
 
     batch_size                   : int            = 16
     n_features                   : int            = 128
@@ -64,7 +66,7 @@ class NNClass:
     #
     using_matplotlib             : bool           = False
     compare_with_foreign_model   : bool           = False
-    visualize_each_point_from_nn : int            = 5
+    visualize_points_from_nn     : int            = 100
     visualize_points_from_data   : int            = 100
     #
     samples                      : List[Atoms]    = None
@@ -118,6 +120,7 @@ class NNClass:
 
         self.db_epochs = self.info[self.network_name]
         if self.info[kf].get("predict_each_epoch"):                 self.predict_each_epoch                 = self.info[kf].get("predict_each_epoch")
+        if self.info[kf].get("validate_each_epoch"):                self.validate_each_epoch                = self.info[kf].get("validate_each_epoch")
         if self.info[kf].get("lr"):                                 self.lr                                 = self.info[kf].get("lr")
         if self.info[kf].get("batch_size"):                         self.batch_size                         = self.info[kf].get("batch_size")
         if self.info[kf].get("n_features"):                         self.n_features                         = self.info[kf].get("n_features")
@@ -138,6 +141,9 @@ class NNClass:
         if self.info[kf].get("number_training_examples_percent"):   self.number_training_examples_percent   = self.info[kf].get("number_training_examples_percent")
         if self.info[kf].get("number_validation_examples_percent"): self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent")
 
+        if self.info[kf].get("visualize_points_from_data"):         self.visualize_points_from_data         = self.info[kf].get("visualize_points_from_data")
+        if self.info[kf].get("visualize_points_from_nn"):           self.visualize_points_from_nn           = self.info[kf].get("visualize_points_from_nn")
+
         if self.info[kf].get("units_dimensions"):                   self.units_dimensions                   = self.info[kf].get("units_dimensions")
         if self.info[kf].get("check_list_files"):                   self.check_list_files                   = self.info[kf].get("check_list_files")
 
@@ -155,15 +161,30 @@ class NNClass:
                 self.using_matplotlib = True
 
         if not self.using_matplotlib and self.plot_enabled:
-             self.plotter_progress = Plotter(title="Check Results", pages_info=dict(
-                 xyz_file             = dict(xname="[DFT steps]", yname=f"Energy [{self.units_dimensions['ENERGY']}]",),
-                 xyz_file_sub         = dict(xname="[DFT steps]", yname=f"Energy-(int)E[0], [{self.units_dimensions['ENERGY']}]",),
-                 energy_loss          = dict(xname="Time [s]"   , yname=f"Energy LOSS [{self.units_dimensions['ENERGY']}]",),
-                 forces_loss          = dict(xname="Time [s]"   , yname=f"Force  LOSS [{self.units_dimensions['FORCE']}]",),
-                 dipole_moment_loss   = dict(xname="Time [s]"   , yname=f"Dipole moment LOSS [{self.units_dimensions['DIPOLE_MOMENT']}]",),
-                 e_diff               = dict(xname="[DFT steps]", yname=f"\\Delta Energy [{self.units_dimensions['ENERGY']}]",),
-             ))
-             self.plotter_log = Plotter(title="", engine="gnuplot")
+
+            pages_info = dict()
+            if "energy" in self.training_properties:
+                pages_info["delta_energy"] = dict(xname="[sample number]" , yname=f"\\Delta Energy [{self.units_dimensions['ENERGY']}]",)
+                pages_info["xyz_file"]     = dict(xname="[sample number]" , yname=f"Energy [{self.units_dimensions['ENERGY']}]",)
+                pages_info["xyz_file_sub"] = dict(xname="[sample number]" , yname=f"Energy-(int)E[0], [{self.units_dimensions['ENERGY']}]",)
+                # framework
+                pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units_dimensions['ENERGY']}]",)
+                pages_info["forces_loss"]  = dict(xname="Time [s]", yname=f"Force  LOSS [{self.units_dimensions['FORCE']}]",)
+
+            if "dipole_moment" in self.training_properties:
+                # framework
+                pages_info["dipole_moment_loss"]    = dict(xname="[sample number]", yname=f"Dipole moment LOSS [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                #
+                pages_info["dipole_moment_x"]       = dict(xname="[sample number]", yname=f"Dipole moment [x] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                pages_info["dipole_moment_y"]       = dict(xname="[sample number]", yname=f"Dipole moment [y] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                pages_info["dipole_moment_z"]       = dict(xname="[sample number]", yname=f"Dipole moment [z] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                #
+                pages_info["delta_dipole_moment_x"] = dict(xname="[sample number]", yname=f"\\Delta Dipole moment [x] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                pages_info["delta_dipole_moment_y"] = dict(xname="[sample number]", yname=f"\\Delta Dipole moment [y] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                pages_info["delta_dipole_moment_z"] = dict(xname="[sample number]", yname=f"\\Delta Dipole moment [z] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+
+            self.plotter_progress = Plotter(title="Check Results", pages_info=pages_info)
+            self.plotter_log = Plotter(title="", engine="gnuplot")
 
 
     def check_provided_parameters(self) -> None:
@@ -252,7 +273,7 @@ class NNClass:
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         self.storer  = Storer(dump_name=self.network_name, dump_path=self.model_path, compressed=False)
 
-    def plot_training_progress(self) -> None:
+    def validate(self) -> None:
         """
         Plotting the training progress by the framework.
 
@@ -278,38 +299,37 @@ class NNClass:
         # Get final validation errors
         print_function(f"""
 
-Validation MAE | epochs {self.storer.get(self.name4storer)}:
-          <energy> [{self.units_dimensions['ENERGY']}]          : {energy_loss[-1]}
-          <forces> [{self.units_dimensions['FORCE']}] : {forces_loss[-1]}
-          <dipole moment> [{self.units_dimensions['DIPOLE_MOMENT']}]     : {dipole_moment_loss[-1]}
+Validation LOSS | epochs {self.storer.get(self.name4storer)}:
+          <energy> [{self.units_dimensions['ENERGY']}]: {str(energy_loss[-1])[:10]:>15}
+          <forces> [{self.units_dimensions['FORCE']}]: {str(forces_loss[-1])[:10]}
+          <dipole moment> [{self.units_dimensions['DIPOLE_MOMENT']}]: {str(dipole_moment_loss[-1])[:10]}
 
         """)
-        #print_function('Validation MAE:')
-        #print_function('    energy: {:10.5f} Hartree'.format(energy_loss[-1]))
-        #print_function('    forces: {:10.5f} Hartree/\u212B'.format(forces_loss[-1]))
 
-        if not self.using_matplotlib:
-            if 'energy'        in self.training_properties: self.plotter_progress.plot(x=time, y=energy_loss,        key_name="", page="energy_loss")
-            if 'forces'        in self.training_properties: self.plotter_progress.plot(x=time, y=forces_loss,        key_name="", page="forces_loss")
-            if 'dipole_moment' in self.training_properties: self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
+        if self.meta: return
         else:
-            # Matplotlib instructions
-            plt.figure(figsize=(14,5))
+            if not self.using_matplotlib:
+                if 'energy'        in self.training_properties: self.plotter_progress.plot(x=time, y=energy_loss,        key_name="", page="energy_loss")
+                if 'forces'        in self.training_properties: self.plotter_progress.plot(x=time, y=forces_loss,        key_name="", page="forces_loss")
+                if 'dipole_moment' in self.training_properties: self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
+            else:
+                # Matplotlib instructions
+                plt.figure(figsize=(14,5))
 
-            # Plot energies
-            plt.subplot(1,2,1)
-            plt.plot(time, energy_loss)
-            plt.title("Energy")
-            plt.ylabel("Energy LOSS [{self.units_dimensions['ENERGY']}]")
-            plt.xlabel("Time [s]")
+                # Plot energies
+                plt.subplot(1,2,1)
+                plt.plot(time, energy_loss)
+                plt.title("Energy")
+                plt.ylabel("Energy LOSS [{self.units_dimensions['ENERGY']}]")
+                plt.xlabel("Time [s]")
 
-            # Plot forces
-            plt.subplot(1,2,2)
-            plt.plot(time, forces_loss)
-            plt.title("Forces")
-            plt.ylabel("Force LOSS [{self.units_dimensions['FORCE']}]")
-            plt.xlabel("Time [s]")
-            plt.show()
+                # Plot forces
+                plt.subplot(1,2,2)
+                plt.plot(time, forces_loss)
+                plt.title("Forces")
+                plt.ylabel("Force LOSS [{self.units_dimensions['FORCE']}]")
+                plt.xlabel("Time [s]")
+                plt.show()
 
     def prepare_databases(self, redo:bool = False, index:str = "0:10:10", xyz_file:str = "noname.xyz") -> None:
         # recreating databases
@@ -322,7 +342,7 @@ Validation MAE | epochs {self.storer.get(self.name4storer)}:
 
         print_function(f"{self.internal_name} Checking databases...")
         db_path_fname = os.path.join(self.db_path, xyz_file + "_"+ str(index) + ".db")
-        if os.path.exists(db_path_fname): print_function(f" - - -> {index} [OK]")
+        if os.path.exists(db_path_fname): print_function(f" ==> {xyz_file + '_' + str(index) + '.db'} [OK]")
         else:
             # no databases is found
             print_function(f"{self.internal_name} Preparing databases...")
@@ -513,11 +533,13 @@ Validation MAE | epochs {self.storer.get(self.name4storer)}:
             else:
                 # Training
                 self.trainer.train(device=self.device, n_epochs=1)
-                if epoch > 1 and self.plot_enabled: self.plot_training_progress()
 
                 # Storing checkpoint
                 self.storer.put(what=epochs_done+1, name=self.name4storer)
                 self.storer.dump()
+
+                if epoch % self.validate_each_epoch == 0 and epoch != 0:
+                    self.validate()
 
                 if epoch % self.predict_each_epoch == 0 and epoch != 0:
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
@@ -525,40 +547,9 @@ Validation MAE | epochs {self.storer.get(self.name4storer)}:
                     self.use_model_on_test(db_name=indexes)
 
         # Show the last epoch
+        self.validate()
         self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
         print_function(f"{self.internal_name} [model training] done.")
-
-    def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
-        print_function(f"{self.internal_name} Visualizing regions of interest...")
-        # visualization whole range of points
-        if xyz_file:
-            self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
-            source_of_points = AtomsData(self.db_path + xyz_file+"_"+indexes+".db", load_only=self.training_properties)
-        # end
-        current_energy = []
-
-        try:     start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
-        except:
-            try: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
-            except: start_region_of_interest, end_region_of_interest = 0, len(self.samples)
-
-        num_samples = len(source_of_points)
-
-        if samples4showing > num_samples:
-            print_function(f"Warning! You requested samples for showing: {samples4showing}, however available only {num_samples}.")
-            samples4showing = num_samples
-
-        # choose number of points from the train data of region of interest
-        idx_samples = [int(i) for i in np.linspace(0, num_samples-1, samples4showing)]
-
-        for idx in idx_samples:
-            _, props = source_of_points.get_properties(idx)
-            current_energy.append(props["energy"][0])
-        y = np.array(current_energy)
-        x = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, samples4showing)]
-        if not self.using_matplotlib:
-            self.plotter_progress.plot(x=x, y=y,        key_name="data: train/showed:["+str(num_samples)+"/"+str(samples4showing)+"] total:" + str(len(self.samples)), page="xyz_file")
-            self.plotter_progress.plot(x=x, y=(y-y[0]), key_name="data: train/showed:["+str(num_samples)+"/"+str(samples4showing)+"] total:" + str(len(self.samples)), page="xyz_file_sub")
 
     def train_model(self) -> None:
         """
@@ -589,6 +580,41 @@ Validation MAE | epochs {self.storer.get(self.name4storer)}:
                 self._train(epochs=epochs, indexes=indexes, xyz_file=xyz_file)
                 self.use_model_on_test(db_name=indexes)
 
+    def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
+        print_function(f"{self.internal_name} Visualizing regions of interest...")
+        # visualization whole range of points
+        if xyz_file:
+            self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
+            source_of_points = AtomsData(self.db_path + xyz_file+"_"+indexes+".db", load_only=self.training_properties)
+        # end
+        current_energy = []
+        num_samples = len(source_of_points)
+
+        if samples4showing > num_samples:
+            print_function(f"Warning! You requested samples for showing: {samples4showing}, however available only {num_samples}.")
+            samples4showing = num_samples
+
+        try:     start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
+        except:
+            try: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
+            except: start_region_of_interest, end_region_of_interest    = 0, num_samples-1
+
+        # choose number of points from the source_of_points of region of interest
+        self.idx4vis = idx_samples = [int(i) for i in np.linspace(0, num_samples-1, samples4showing)]
+
+        for idx in idx_samples:
+            _, props = source_of_points.get_properties(idx)
+            current_energy.append(props["energy"][0])
+        y = np.array(current_energy)
+        x = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, samples4showing)]
+        assert(len(y) == len(x), "Strange it x-y lengths are different")
+        if not self.using_matplotlib:
+            if 'energy' in self.training_properties:
+                key_name = "data: train/showed:["+str(num_samples)+"/"+str(samples4showing)+"] total:" + str(len(self.samples))
+                self.plotter_progress.plot(x=x, y=y,        key_name=key_name, page="xyz_file")
+                self.plotter_progress.plot(x=x, y=(y-y[0]), key_name=key_name, page="xyz_file_sub")
+
+
     def predict(self, indexes:str  = None, xyz_file:str = None, epochs_done:int = None, path2foreign_model:str = None) -> None:
         """
         Prediction method.
@@ -599,75 +625,113 @@ Validation MAE | epochs {self.storer.get(self.name4storer)}:
         - epochs_done [None] -- int used in plotting (optional)
         - path2foreign_model [None]  -- if set used for comparing
         """
-        if 'dipole_moment' in self.training_properties or self.meta:
+        if self.meta:
             """
-            * No prodiction for dipole moment yet.
             * No need to predict anything on the remote job
             """
             return
         else:
+            def compute_and_account(best_model, batch, idx):
+                ## move batch to GPU, if necessary
+                #batch = {k: v.to(self.device) for k, v in batch.items()}
+                pred = best_model(batch)
+                if "energy"        in self.training_properties:
+                    preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
+                    preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
+                if "dipole_moment" in self.training_properties:
+                    preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
+                    preds["pred_dipole_moment"].append((idx, pred["dipole_moment"].detach().cpu().numpy()))
 
             if path2foreign_model is not None:
                 if not self.foreign_plotted: self.foreign_plotted = True
                 network_name = key_prefix = "foreign_model"
                 model_path   = path2foreign_model
-                fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
+                #fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
                 epochs_done  = "[UNKNOWN]"
             else:
                 network_name = key_prefix = str(self.network_name)
                 model_path   = self.model_path
-                fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
-
-            print_function(f"{self.internal_name} Prediction check [{network_name}]")
-            step = None
-            try:    start_region_of_interest, end_region_of_interest, step = [int(val) for val in indexes.split(":")]  # interval of interest
-            except: start_region_of_interest, end_region_of_interest       = [int(val) for val in indexes.split(":")]  # interval of interest without step
-            print_function(f"Region of interest: [start:{start_region_of_interest}|end:{end_region_of_interest}|step:{step}]")
-            print_function(f"Visualization of each {self.visualize_each_point_from_nn}th sample...")
+                #fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
             # creating folder for model test
+            print_function(f"{self.internal_name} Prediction check [{network_name}]")
+
             test_path = os.path.join(self.test_path, network_name); os.makedirs(test_path, exist_ok=True)
-            fname     = os.path.join(test_path, fname_name)
+            #fname     = os.path.join(test_path, fname_name)
 
-            if not os.path.exists(fname):
-                initial_predicted_energy = []
+            check_xyz_file = list(self.check_list_files.keys()) + [xyz_file]
 
+            for xyz_file in check_xyz_file:
+                #
                 print_function(f"Reading {xyz_file}...")
-                samples = read(self.xyz_path + xyz_file, index=indexes, format="extxyz")
-                num_samples = len(samples)
-                print_function(f"Num samples: {num_samples}")
+                self.prepare_databases(redo=False, index=":", xyz_file=xyz_file)
+                db_path_fname = os.path.join(self.db_path, xyz_file + "_:.db")
+                print_function(f"Loading... | {db_path_fname}")
+                #
+                if xyz_file in self.db_epochs.keys():
+                    subsamples_loader = AtomsLoader(self.train_samples, batch_size=1)
+                    idxs = self.idx4vis
+                else:
+                    samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
+                    subsamples, idxs = spk.get_subset(
+                        data         = samples,
+                        num_samples  = self.visualize_points_from_nn,
+                    )
+                    subsamples_loader = AtomsLoader(subsamples, batch_size=1)
 
                 print_function(f"[{network_name}] Loading the last best model")
                 best_model = torch.load(os.path.join(model_path, 'best_model'))
 
-                calc = spk.interfaces.SpkCalculator(
-                        model=best_model,
-                        device=self.device,
-                        energy='energy',
-                        forces='forces',
-                        environment_provider=spk.environment.AseEnvironmentProvider(6.)
-                        )
+                print_function(f"Predicting on subset [#{len(idxs)}]...")
+                self.preds = preds = defaultdict(list)
 
-                print_function(f"Predicting...")
-                for idx_sample in tqdm(range(0,num_samples,self.visualize_each_point_from_nn)):
-                    sample = samples[idx_sample]
-                    if 'energy'        in self.training_properties: true_energy = sample.get_potential_energy()
-                    if 'dipole_moment' in self.training_properties: true_dipole = sample.get_dipole_moment()
-                    sample.set_calculator(calc)
-                    initial_predicted_energy.append( (true_energy, sample.get_potential_energy()) )
-                np.savetxt(fname, X=np.array(initial_predicted_energy))
 
-            initial_predicted_energy = np.loadtxt(fname)
-            # Plotting
-            y      = initial_predicted_energy[:, 1]  # take predicted energy
-            y_diff = initial_predicted_energy[:, 0] - initial_predicted_energy[:, 1]  # 'correct' - predicted energies
-            x      = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, len(y)-2 )]  # TODO CHECK INDEXES
+                if len(subsamples_loader) == self.visualize_points_from_nn:
+                    for idx, batch in enumerate(subsamples_loader): compute_and_account(best_model, batch, idxs[idx])
+                else:
+                    for idx, batch in enumerate(subsamples_loader):
+                        if idx in idxs: compute_and_account(best_model, batch, idx)
 
-            if not self.using_matplotlib and self.plot_enabled:
-                key_name = key_prefix+" epoch:"+str(epochs_done) + " predicted:" + str(len(y))
-                self.plotter_progress.plot(x=x, y=y,        key_name=key_name, page="xyz_file")
-                self.plotter_progress.plot(x=x, y=(y-y[0]), key_name=key_name, page="xyz_file_sub")
-                self.plotter_progress.plot(x=x, y=y_diff,   key_name=key_name, page="e_diff")
+                ## Plotting
+
+                if not self.using_matplotlib and self.plot_enabled:
+                    try: sysname = xyz_file.split("_")[0]
+                    except: sysname = "unnamed"
+
+                    if 'energy' in self.training_properties:
+                        pred_energy        = np.array(preds["pred_energy"], dtype=float)
+                        sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
+                        orig_energy        = np.array(preds["orig_energy"], dtype=float)
+                        sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
+
+                        key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        self.plotter_progress.plot(page="xyz_file",     key_name = key_name, x=sorted_pred_energy[:,0], y=sorted_pred_energy[:,1],  animation=True)
+                        self.plotter_progress.plot(page="xyz_file_sub", key_name = key_name, x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_pred_energy[:,1][0]), )
+                        self.plotter_progress.plot(page="delta_energy", key_name = key_name, x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
+
+                    if 'dipole_moment' in self.training_properties:
+                        pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                        self.CHECK = sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
+                        orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                        sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
+
+                        #
+                        key_name = "data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
+                        self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name, x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]))
+                        self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name, x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]))
+                        self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name, x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]))
+
+                        #
+                        key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_dipole_moment))}"
+                        self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+                        self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+                        self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+
+                        # delta
+                        self.plotter_progress.plot(page="delta_dipole_moment_x", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,0])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,0])) )
+                        self.plotter_progress.plot(page="delta_dipole_moment_y", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,1])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,1])) )
+                        self.plotter_progress.plot(page="delta_dipole_moment_z", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,2])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,2])) )
+
 
     def use_model_on_test(self, db_name:str = None, path2model:str = None,) -> None:
         """
@@ -722,10 +786,10 @@ Validation MAE | epochs {self.storer.get(self.name4storer)}:
 
         print_function(f"""
 
-Test MAE | epochs {self.storer.get(self.name4storer)}:
-          <energy> [{self.units_dimensions["ENERGY"]}]          : {energy_error}
-          <forces> [{self.units_dimensions["FORCE"]}] : {forces_error}
-          <dipole moment> [{self.units_dimensions["DIPOLE_MOMENT"]}]     : {dipole_moment_error}
+Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #{samples_to_account}:
+          <energy> [{self.units_dimensions["ENERGY"]}]: {str(energy_error):>25}
+          <forces> [{self.units_dimensions["FORCE"]}]: {str(forces_error):>25}
+          <dipole moment> [{self.units_dimensions["DIPOLE_MOMENT"]}]: {str(dipole_moment_error):>25}
 
         """)
 
