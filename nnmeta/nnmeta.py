@@ -60,48 +60,70 @@ class GPUInfo:
     def get_info(self):
         self.gpus.clear()
 
-        p = Popen(['nvidia-smi', '-q', '-x'], stdout=PIPE)
+        p = Popen(["nvidia-smi", "-q", "-x"], stdout=PIPE)
         outs, errors = p.communicate()
         root = ET.fromstring(outs)
 
-        num_gpus = int(root.find('attached_gpus').text)
-        for gpu_id, gpu in enumerate(root.iter('gpu')):
+        num_gpus = int(root.find("attached_gpus").text)
+        for gpu_id, gpu in enumerate(root.iter("gpu")):
             gpu_info = dict()
             # idx and name
             gpu_info["idx"] = gpu_id
-            name = gpu.find('product_name').text
-            gpu_info['name'] = name
+            name = gpu.find("product_name").text
+            gpu_info["name"] = name
+
+            # GPU UUID
+            gpu_uuid = gpu.find("GPU UUID").text
+            gpu_info["gpu_uuid"] = gpu_uuid
 
             # get memory
-            memory_usage = gpu.find('fb_memory_usage')
-            total = memory_usage.find('total').text
-            used  = memory_usage.find('used').text
-            free  = memory_usage.find('free').text
-            gpu_info['memory'] = dict(total = total, used = used, free = free)
+            memory_usage = gpu.find("fb_memory_usage")
+            total = memory_usage.find("total").text
+            used  = memory_usage.find("used").text
+            free  = memory_usage.find("free").text
+            gpu_info["memory"] = dict(total = total, used = used, free = free)
 
             # get utilization
-            utilization = gpu.find('utilization')
-            gpu_util    = utilization.find('gpu_util').text
-            memory_util = utilization.find('memory_util').text
-            gpu_info['utilization'] = dict(gpu_util = gpu_util, memory_util = memory_util)
+            utilization = gpu.find("utilization")
+            gpu_util    = utilization.find("gpu_util").text
+            memory_util = utilization.find("memory_util").text
+            gpu_info["utilization"] = dict(gpu_util = gpu_util, memory_util = memory_util)
 
             # processes
-            processes = gpu.find('processes')
+            processes = gpu.find("processes")
             infos = []
-            for info in processes.iter('process_info'):
-                pid          = info.find('pid').text
-                process_name = info.find('process_name').text
-                used_memory  = info.find('used_memory').text
+            for info in processes.iter("process_info"):
+                pid          = info.find("pid").text
+                process_name = info.find("process_name").text
+                used_memory  = info.find("used_memory").text
                 infos.append(dict(pid = pid, process_name = process_name, used_memory = used_memory))
-            gpu_info['processes'] = infos
+            gpu_info["processes"] = infos
             self.gpus.append(gpu_info)
 
     def __post_init__(self):
         self.get_info()
 
     def notify(self):
+        idx_in_use = self.get_visible_gpu()
         for gpu in self.gpus:
-            print(f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']} / {gpu['memory']['total']} | JOBS: {len(gpu['processes'])}")
+            notify_string = f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']} / {gpu['memory']['total']} | JOBS: {len(gpu['processes'])}"
+            if gpu['idx'] in idx_in_use: notify_string += " <--- in USE"
+            print_function(notify_string)
+
+    def get_visible_gpu(self) -> List:
+        """
+        Method goes though visible devices [Meta] compare their GPU UUID and available
+
+        """
+        idx = []
+        try:             visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"].split(",") # meta
+        except KeyError: visible_gpu = self.get_empty_gpu()                          # local
+
+        for gpu in self.gpus:
+            # uuid/ idx
+            if gpu["gpu_uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu['idx'])
+        return idx
+
 
 
     def get_empty_gpu(self)  -> List:
@@ -112,9 +134,8 @@ class GPUInfo:
         idx = []
         for gpu in self.gpus:
             # exclude /usr/lib/xorg/Xorg | /usr/bin/gnome-shell
-            if len(gpu['processes']) <= 2:
+            if len(gpu['processes']) == 0:
                 idx.append(gpu['idx'])
-
         if len(idx) == 0: print("[Warning!] No empty devices!")
         return idx
 
