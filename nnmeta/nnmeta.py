@@ -95,8 +95,9 @@ class GPUInfo:
             for info in processes.iter("process_info"):
                 pid          = info.find("pid").text
                 process_name = info.find("process_name").text
+                process_type = info.find("type").text
                 used_memory  = info.find("used_memory").text
-                infos.append(dict(pid = pid, process_name = process_name, used_memory = used_memory))
+                infos.append(dict(pid = pid, process_name = process_name, process_type = process_type, used_memory = used_memory))
             gpu_info["processes"] = infos
             self.gpus.append(gpu_info)
 
@@ -104,39 +105,51 @@ class GPUInfo:
         self.get_info()
 
     def notify(self):
-        idx_in_use = self.get_visible_gpu()
+        idx_in_use = self.get_gpu_in_use()
         for gpu in self.gpus:
             notify_string = f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']} / {gpu['memory']['total']} | JOBS: {len(gpu['processes'])}"
             if gpu['idx'] in idx_in_use: notify_string += " <--- in USE"
             print_function(notify_string)
 
-    def get_visible_gpu(self) -> List:
+    def get_gpu_in_use(self) -> List:
         """
-        Method goes though visible devices [Meta] compare their GPU UUID and available
+        Returns GPU indexes: either visible devices or free of task
 
         """
         idx = []
-        try:             visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"].split(",") # meta
-        except KeyError: visible_gpu = self.get_empty_gpu()                          # local
+        try:             visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        except KeyError: visible_gpu = self.get_empty_gpu()
+        if len(visible_gpu) == 0: visible_gpu = self.get_empty_gpu_excluded_G_jobs()
 
         for gpu in self.gpus:
             # uuid/ idx
-            if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu['idx'])
+            if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu["idx"])
         return idx
-
-
 
     def get_empty_gpu(self)  -> List:
         """
-        return indexes of free gpu
+        return indexes of free task GPU
 
         """
         idx = []
         for gpu in self.gpus:
-            # exclude /usr/lib/xorg/Xorg | /usr/bin/gnome-shell
-            if len(gpu['processes']) == 0:
-                idx.append(gpu['idx'])
+            if len(gpu["processes"]) == 0: idx.append(gpu["idx"])
         if len(idx) == 0: print("[Warning!] No empty devices!")
+        return idx
+
+    def get_empty_gpu_excluded_G_jobs(self) -> List:
+        """
+        return indexes of G type free task GPU
+
+        """
+        idx = []
+        for gpu in self.gpus:
+            g_type_process_jobs = 0
+            for job in gpu["processes"]:
+                if job["type"].upper() == "G": g_type_process_jobs += 1
+            number_jobs_without_g_type = len(gpu["processes"]) - g_type_process_jobs
+            if len(gpu["processes"]) == 0: idx.append(gpu["idx"])
+        if len(idx) == 0: print("[Warning!] No empty devices even without G type jobs!")
         return idx
 
 ## NNMeta
@@ -342,7 +355,7 @@ class NNClass:
 
     def print_info(self) -> None:
         print_function(f"""
-# # # # # # # # # # # [INFORMATION | device {self.device}:{list(range(torch.cuda.device_count()))}] # # # # # # # # # # #
+# # # # # # # # # # # [INFORMATION | device {self.device}:{self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
         LEARNING RATE                :   {self.lr}
