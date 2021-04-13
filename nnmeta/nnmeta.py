@@ -73,8 +73,8 @@ class GPUInfo:
             gpu_info["name"] = name
 
             # GPU UUID
-            gpu_uuid = gpu.find("GPU UUID").text
-            gpu_info["gpu_uuid"] = gpu_uuid
+            gpu_uuid = gpu.find("uuid").text
+            gpu_info["uuid"] = gpu_uuid
 
             # get memory
             memory_usage = gpu.find("fb_memory_usage")
@@ -121,7 +121,7 @@ class GPUInfo:
 
         for gpu in self.gpus:
             # uuid/ idx
-            if gpu["gpu_uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu['idx'])
+            if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu['idx'])
         return idx
 
 
