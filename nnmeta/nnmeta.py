@@ -1,3 +1,28 @@
+##*
+## MIT License
+##
+## NNMeta - Copyright (c) 2020-2021 Aleksandr Kazakov
+##
+## Permission is hereby granted, free of charge, to any person obtaining a copy
+## of this software and associated documentation files (the "Software"), to deal
+## in the Software without restriction, including without limitation the rights
+## to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+## copies of the Software, and to permit persons to whom the Software is
+## furnished to do so, subject to the following conditions:
+##
+## The above copyright notice and this permission notice shall be included in all
+## copies or substantial portions of the Software.
+##
+## THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+## IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+## FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+## AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+## LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+## OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+## SOFTWARE.
+##*
+
+
 from dataclasses import dataclass, field
 from typing      import List, Any
 from torch       import Tensor
@@ -8,7 +33,7 @@ import numpy      as np
 import schnetpack as spk
 
 import torch
-import os, sys, shutil
+import os, sys, shutil, re
 from schnetpack.atomistic.model import AtomisticModel
 from schnetpack                 import AtomsLoader
 from schnetpack                 import AtomsData
@@ -25,9 +50,79 @@ from tqdm import tqdm
 if tqdm: print_function = tqdm.write
 else:    print_function = print
 
+from subprocess import Popen, PIPE
+import xml.etree.ElementTree as ET
+
+@dataclass
+class GPUInfo:
+    gpus : List = field(default_factory=list)
+
+    def get_info(self):
+        self.gpus.clear()
+
+        p = Popen(['nvidia-smi', '-q', '-x'], stdout=PIPE)
+        outs, errors = p.communicate()
+        root = ET.fromstring(outs)
+
+        num_gpus = int(root.find('attached_gpus').text)
+        for gpu_id, gpu in enumerate(root.iter('gpu')):
+            gpu_info = dict()
+            # idx and name
+            gpu_info["idx"] = gpu_id
+            name = gpu.find('product_name').text
+            gpu_info['name'] = name
+
+            # get memory
+            memory_usage = gpu.find('fb_memory_usage')
+            total = memory_usage.find('total').text
+            used  = memory_usage.find('used').text
+            free  = memory_usage.find('free').text
+            gpu_info['memory'] = dict(total = total, used = used, free = free)
+
+            # get utilization
+            utilization = gpu.find('utilization')
+            gpu_util    = utilization.find('gpu_util').text
+            memory_util = utilization.find('memory_util').text
+            gpu_info['utilization'] = dict(gpu_util = gpu_util, memory_util = memory_util)
+
+            # processes
+            processes = gpu.find('processes')
+            infos = []
+            for info in processes.iter('process_info'):
+                pid          = info.find('pid').text
+                process_name = info.find('process_name').text
+                used_memory  = info.find('used_memory').text
+                infos.append(dict(pid = pid, process_name = process_name, used_memory = used_memory))
+            gpu_info['processes'] = infos
+            self.gpus.append(gpu_info)
+
+    def __post_init__(self):
+        self.get_info()
+
+    def notify(self):
+        for gpu in self.gpus:
+            print(f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']} / {gpu['memory']['total']} | JOBS: {len(gpu['processes'])}")
+
+
+    def get_empty_gpu(self)  -> List:
+        """
+        return indexes of free gpu
+
+        """
+        idx = []
+        for gpu in self.gpus:
+            # exclude /usr/lib/xorg/Xorg | /usr/bin/gnome-shell
+            if len(gpu['processes']) <= 2:
+                idx.append(gpu['idx'])
+
+        if len(idx) == 0: print("[Warning!] No empty devices!")
+        return idx
+
+## NNMeta
+
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.5.2"
+    __version__                  : str            = "1.5.3"
     debug                        : bool           = False
 
     internal_name                : str            = "[NNClass]"
@@ -38,6 +133,7 @@ class NNClass:
     device                       : str            = "cuda" if torch.cuda.is_available() else "cpu"
     network_name                 : str            = "unknower"
     info                         : dict           = field(default_factory=dict)
+    gpu_info                     : GPUInfo        = GPUInfo()
     #
     db_properties                : tuple          = ("energy", "forces", "dipole_moment")  # properties look for database
     training_properties          : tuple          = ("energy", "forces", "dipole_moment")  # properties used for training
@@ -495,7 +591,11 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             self.model = AtomisticModel(representation, output_modules)
             print_function(f"Model parameters: {self.model}")
 
-            self.model = torch.nn.DataParallel(self.model)
+            if self.device == "cuda":
+                self.gpu_info.notify()
+                idx = self.gpu_info.get_empty_gpu()
+                print("IDX:", idx)
+                self.model = torch.nn.DataParallel(self.model)
             print_function(f"{self.internal_name} [model building] done.")
 
 
