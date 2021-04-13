@@ -104,12 +104,15 @@ class GPUInfo:
     def __post_init__(self):
         self.get_info()
 
-    def notify(self):
+    def notify(self, about_in_use_only:bool = False):
+        self.get_info()
         idx_in_use = self.get_gpu_in_use()
         for gpu in self.gpus:
-            notify_string = f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']} / {gpu['memory']['total']} | JOBS: {len(gpu['processes'])}"
-            if gpu['idx'] in idx_in_use: notify_string += " <--- in USE"
-            print_function(notify_string)
+            notify_string = f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']:>10} / {gpu['memory']['total']:<10} | JOBS: {len(gpu['processes'])}"
+            if gpu['idx'] in idx_in_use:
+                if not about_in_use_only: notify_string += " <--- in USE"
+                else: print_function(notify_string)
+            if not about_in_use_only: print_function(notify_string)
 
     def get_gpu_in_use(self) -> List:
         """
@@ -355,7 +358,7 @@ class NNClass:
 
     def print_info(self) -> None:
         print_function(f"""
-# # # # # # # # # # # [INFORMATION | device {self.device}:{self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
+# # # # # # # # # # # [INFORMATION | device {self.device}|idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
         LEARNING RATE                :   {self.lr}
@@ -626,10 +629,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             print_function(f"Model parameters: {self.model}")
 
             if self.device == "cuda":
-                self.gpu_info.notify()
-                idx = self.gpu_info.get_empty_gpu()
-                print("IDX:", idx)
-                self.model = torch.nn.DataParallel(self.model)
+                idx = self.get_gpu_in_use()
+                self.model = torch.nn.DataParallel(self.model, device_ids=idx)
             print_function(f"{self.internal_name} [model building] done.")
 
 
@@ -665,6 +666,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
             if epoch <= epochs_done: continue
             else:
+                showed = False
                 # Training
                 self.trainer.train(device=self.device, n_epochs=1)
 
@@ -673,14 +675,17 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.storer.dump()
 
                 if epoch % self.validate_each_epoch == 0 and epoch != 0:
+                    if not showed: self.gpu_info.notify(True); showed=True
                     self.validate()
 
                 if epoch % self.predict_each_epoch == 0 and epoch != 0:
+                    if not showed: self.gpu_info.notify(True); showed=True
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
                     self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
                     self.use_model_on_test(db_name=indexes)
 
         # Show the last epoch
+        self.gpu_info.notify(True)
         self.validate()
         self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
         print_function(f"{self.internal_name} [model training] done.")
@@ -929,6 +934,7 @@ Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #
 
     def prepare_network(self, redo:bool = False) -> None:
         self.create_model_path(redo=redo)
+        self.gpu_info.notify()
         self.print_info()
         self.train_model()
 
