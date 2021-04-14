@@ -1,3 +1,28 @@
+##*
+## MIT License
+##
+## NNMeta - Copyright (c) 2020-2021 Aleksandr Kazakov
+##
+## Permission is hereby granted, free of charge, to any person obtaining a copy
+## of this software and associated documentation files (the "Software"), to deal
+## in the Software without restriction, including without limitation the rights
+## to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+## copies of the Software, and to permit persons to whom the Software is
+## furnished to do so, subject to the following conditions:
+##
+## The above copyright notice and this permission notice shall be included in all
+## copies or substantial portions of the Software.
+##
+## THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+## IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+## FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+## AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+## LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+## OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+## SOFTWARE.
+##*
+
+
 from dataclasses import dataclass, field
 from typing      import List, Any
 from torch       import Tensor
@@ -8,7 +33,7 @@ import numpy      as np
 import schnetpack as spk
 
 import torch
-import os, sys, shutil
+import os, sys, shutil, re
 from schnetpack.atomistic.model import AtomisticModel
 from schnetpack                 import AtomsLoader
 from schnetpack                 import AtomsData
@@ -25,9 +50,116 @@ from tqdm import tqdm
 if tqdm: print_function = tqdm.write
 else:    print_function = print
 
+from subprocess import Popen, PIPE
+import xml.etree.ElementTree as ET
+
+@dataclass
+class GPUInfo:
+    gpus : List = field(default_factory=list)
+
+    def get_info(self):
+        self.gpus.clear()
+
+        p = Popen(["nvidia-smi", "-q", "-x"], stdout=PIPE)
+        outs, errors = p.communicate()
+        root = ET.fromstring(outs)
+
+        num_gpus = int(root.find("attached_gpus").text)
+        for gpu_id, gpu in enumerate(root.iter("gpu")):
+            gpu_info = dict()
+            # idx and name
+            gpu_info["idx"] = gpu_id
+            name = gpu.find("product_name").text
+            gpu_info["name"] = name
+
+            # GPU UUID
+            gpu_uuid = gpu.find("uuid").text
+            gpu_info["uuid"] = gpu_uuid
+
+            # get memory
+            memory_usage = gpu.find("fb_memory_usage")
+            total = memory_usage.find("total").text
+            used  = memory_usage.find("used").text
+            free  = memory_usage.find("free").text
+            gpu_info["memory"] = dict(total = total, used = used, free = free)
+
+            # get utilization
+            utilization = gpu.find("utilization")
+            gpu_util    = utilization.find("gpu_util").text
+            memory_util = utilization.find("memory_util").text
+            gpu_info["utilization"] = dict(gpu_util = gpu_util, memory_util = memory_util)
+
+            # processes
+            processes = gpu.find("processes")
+            infos = []
+            for info in processes.iter("process_info"):
+                pid          = info.find("pid").text
+                process_name = info.find("process_name").text
+                process_type = info.find("type").text
+                used_memory  = info.find("used_memory").text
+                infos.append(dict(pid = pid, process_name = process_name, process_type = process_type, used_memory = used_memory))
+            gpu_info["processes"] = infos
+            self.gpus.append(gpu_info)
+
+    def __post_init__(self):
+        self.get_info()
+
+    def notify(self, about_in_use_only:bool = False):
+        self.get_info()
+        idx_in_use = self.get_gpu_in_use()
+        for gpu in self.gpus:
+            notify_string = f"ID:{gpu['idx']} | NAME:{gpu['name']} | MEMORY: {gpu['memory']['used']:>10} / {gpu['memory']['total']:<10} | JOBS: {len(gpu['processes'])}"
+            if gpu['idx'] in idx_in_use:
+                if not about_in_use_only: notify_string += " <--- in USE"
+                else: print_function(notify_string)
+            if not about_in_use_only: print_function(notify_string)
+
+    def get_gpu_in_use(self) -> List:
+        """
+        Returns GPU indexes: either visible devices or free of task
+
+        """
+        idx = []
+        try:             visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        except KeyError: visible_gpu = self.get_empty_gpu()
+        if len(visible_gpu) == 0: visible_gpu = self.get_empty_gpu_excluded_G_jobs()
+
+        for gpu in self.gpus:
+            # uuid/ idx
+            if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu["idx"])
+        return idx
+
+    def get_empty_gpu(self)  -> List:
+        """
+        return indexes of free task GPU
+
+        """
+        idx = []
+        for gpu in self.gpus:
+            if len(gpu["processes"]) == 0: idx.append(gpu["idx"])
+        if len(idx) == 0: print("[Warning!] No empty devices!")
+        return idx
+
+    def get_empty_gpu_excluded_G_jobs(self) -> List:
+        """
+        return indexes of G type free task GPU
+
+        """
+        idx = []
+        for gpu in self.gpus:
+            g_type_process_jobs = 0
+            for job in gpu["processes"]:
+                if job["type"].upper() == "G": g_type_process_jobs += 1
+            number_jobs_without_g_type = len(gpu["processes"]) - g_type_process_jobs
+            if len(gpu["processes"]) == 0: idx.append(gpu["idx"])
+        if len(idx) == 0: print("[Warning!] No empty devices even without G type jobs!")
+        return idx
+
+## NNMeta
+
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.5.2"
+    __version__                  : str            = "1.5.3"
     debug                        : bool           = False
 
     internal_name                : str            = "[NNClass]"
@@ -38,6 +170,7 @@ class NNClass:
     device                       : str            = "cuda" if torch.cuda.is_available() else "cpu"
     network_name                 : str            = "unknower"
     info                         : dict           = field(default_factory=dict)
+    gpu_info                     : GPUInfo        = GPUInfo()
     #
     db_properties                : tuple          = ("energy", "forces", "dipole_moment")  # properties look for database
     training_properties          : tuple          = ("energy", "forces", "dipole_moment")  # properties used for training
@@ -225,7 +358,7 @@ class NNClass:
 
     def print_info(self) -> None:
         print_function(f"""
-# # # # # # # # # # # [INFORMATION | device {self.device}:{list(range(torch.cuda.device_count()))}] # # # # # # # # # # #
+# # # # # # # # # # # [INFORMATION | device {self.device}|idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
         LEARNING RATE                :   {self.lr}
@@ -495,7 +628,9 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             self.model = AtomisticModel(representation, output_modules)
             print_function(f"Model parameters: {self.model}")
 
-            self.model = torch.nn.DataParallel(self.model)
+            if self.device == "cuda":
+                idx = self.gpu_info.get_gpu_in_use()
+                self.model = torch.nn.DataParallel(self.model)
             print_function(f"{self.internal_name} [model building] done.")
 
 
@@ -531,6 +666,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
             if epoch <= epochs_done: continue
             else:
+                showed = False
                 # Training
                 self.trainer.train(device=self.device, n_epochs=1)
 
@@ -539,14 +675,17 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.storer.dump()
 
                 if epoch % self.validate_each_epoch == 0 and epoch != 0:
+                    if not showed: self.gpu_info.notify(True); showed=True
                     self.validate()
 
                 if epoch % self.predict_each_epoch == 0 and epoch != 0:
+                    if not showed: self.gpu_info.notify(True); showed=True
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
                     self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
                     self.use_model_on_test(db_name=indexes)
 
         # Show the last epoch
+        self.gpu_info.notify(True)
         self.validate()
         self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
         print_function(f"{self.internal_name} [model training] done.")
@@ -795,6 +934,7 @@ Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #
 
     def prepare_network(self, redo:bool = False) -> None:
         self.create_model_path(redo=redo)
+        self.gpu_info.notify()
         self.print_info()
         self.train_model()
 
