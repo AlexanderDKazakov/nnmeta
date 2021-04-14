@@ -630,7 +630,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
             if self.device == "cuda":
                 idx = self.gpu_info.get_gpu_in_use()
-                self.model = torch.nn.DataParallel(self.model, device_ids=idx)
+                self.model = torch.nn.DataParallel(self.model)
             print_function(f"{self.internal_name} [model building] done.")
 
 
