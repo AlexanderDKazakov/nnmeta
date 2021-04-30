@@ -1,7 +1,7 @@
 ##*
 ## MIT License
 ##
-## NNMeta - Copyright (c) 2020-2021 Aleksandr Kazakov
+## NNMeta - Copyright (c) 2020-2021 Aleksandr Kazakov <alexander.d.kazakov|at|gmail.com>
 ##
 ## Permission is hereby granted, free of charge, to any person obtaining a copy
 ## of this software and associated documentation files (the "Software"), to deal
@@ -55,7 +55,8 @@ import xml.etree.ElementTree as ET
 
 @dataclass
 class GPUInfo:
-    gpus : List = field(default_factory=list)
+    gpus       : List = field(default_factory=list)
+    idx_in_use : List = field(default_factory=list)
 
     def get_info(self):
         self.gpus.clear()
@@ -119,14 +120,18 @@ class GPUInfo:
         Returns GPU indexes: either visible devices or free of task
 
         """
-        idx = []
-        try:             visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-        except KeyError: visible_gpu = self.get_empty_gpu()
-        if len(visible_gpu) == 0: visible_gpu = self.get_empty_gpu_excluded_G_jobs()
+        if not self.idx_in_use:
+            idx = []
+            try:             visible_gpu = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+            except KeyError: visible_gpu = self.get_empty_gpu()
+            if len(visible_gpu) == 0: visible_gpu = self.get_empty_gpu_excluded_G_jobs()
 
-        for gpu in self.gpus:
-            # uuid/ idx
-            if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu["idx"])
+            for gpu in self.gpus:
+                # uuid/ idx
+                if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu["idx"])
+            self.idx_in_use = idx
+        else:
+            idx = self.idx_in_use
         return idx
 
     def get_empty_gpu(self)  -> List:
@@ -149,9 +154,9 @@ class GPUInfo:
         for gpu in self.gpus:
             g_type_process_jobs = 0
             for job in gpu["processes"]:
-                if job["type"].upper() == "G": g_type_process_jobs += 1
+                if job["process_type"].upper() == "G": g_type_process_jobs += 1
             number_jobs_without_g_type = len(gpu["processes"]) - g_type_process_jobs
-            if len(gpu["processes"]) == 0: idx.append(gpu["idx"])
+            if number_jobs_without_g_type == 0: idx.append(gpu["idx"])
         if len(idx) == 0: print("[Warning!] No empty devices even without G type jobs!")
         return idx
 
@@ -159,8 +164,9 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.5.3"
+    __version__                  : str            = "1.5.4"
     debug                        : bool           = False
+    _should_train                : bool           = True
 
     internal_name                : str            = "[NNClass]"
     system_path                  : str            = "."
@@ -252,6 +258,8 @@ class NNClass:
             sys.exit(1)
 
         self.db_epochs = self.info[self.network_name]
+        if self.info[kf].get("_should_train") is not None:          self._should_train                      = self.info[kf].get("_should_train")
+        if self.info[kf].get("device")        is not None:          self.device                             = self.info[kf].get("device")
         if self.info[kf].get("predict_each_epoch"):                 self.predict_each_epoch                 = self.info[kf].get("predict_each_epoch")
         if self.info[kf].get("validate_each_epoch"):                self.validate_each_epoch                = self.info[kf].get("validate_each_epoch")
         if self.info[kf].get("lr"):                                 self.lr                                 = self.info[kf].get("lr")
@@ -358,7 +366,7 @@ class NNClass:
 
     def print_info(self) -> None:
         print_function(f"""
-# # # # # # # # # # # [INFORMATION | device {self.device}|idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
+# # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device}| GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
         LEARNING RATE                :   {self.lr}
@@ -684,10 +692,6 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
                     self.use_model_on_test(db_name=indexes)
 
-        # Show the last epoch
-        self.gpu_info.notify(True)
-        self.validate()
-        self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
         print_function(f"{self.internal_name} [model training] done.")
 
     def train_model(self) -> None:
@@ -716,8 +720,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 print_function(f"--> [Trainer] epochs done: {self.trainer.epoch}")
 
                 #
-                self._train(epochs=epochs, indexes=indexes, xyz_file=xyz_file)
-                self.use_model_on_test(db_name=indexes)
+                if self._should_train: self._train(epochs=epochs, indexes=indexes, xyz_file=xyz_file)
+                # Show the last epoch
+                self.gpu_info.notify(True)
+                self.validate()
+                self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
+                if self._should_train: self.use_model_on_test(db_name=indexes)
 
     def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
         print_function(f"{self.internal_name} Visualizing regions of interest...")
@@ -810,6 +818,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 if xyz_file in self.db_epochs.keys():
                     subsamples_loader = AtomsLoader(self.train_samples, batch_size=1)
                     idxs = self.idx4vis
+                    trained_subset = True
                 else:
                     samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
                     subsamples, idxs = spk.get_subset(
@@ -817,6 +826,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         num_samples  = self.visualize_points_from_nn,
                     )
                     subsamples_loader = AtomsLoader(subsamples, batch_size=1)
+                    trained_subset = False
 
                 print_function(f"[{network_name}] Loading the last best model")
                 best_model = torch.load(os.path.join(model_path, 'best_model'))
@@ -834,7 +844,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 ## Plotting
 
                 if not self.using_matplotlib and self.plot_enabled:
-                    try: sysname = xyz_file.split("_")[0]
+                    try: sysname = xyz_file.split("_")[1]
                     except: sysname = "unnamed"
 
                     if 'energy' in self.training_properties:
@@ -843,7 +853,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         orig_energy        = np.array(preds["orig_energy"], dtype=float)
                         sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
 
-                        key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        if trained_subset: key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        else:              key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
                         self.plotter_progress.plot(page="xyz_file",     key_name = key_name, x=sorted_pred_energy[:,0], y=sorted_pred_energy[:,1],  animation=True)
                         self.plotter_progress.plot(page="xyz_file_sub", key_name = key_name, x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_pred_energy[:,1][0]), )
                         self.plotter_progress.plot(page="delta_energy", key_name = key_name, x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
@@ -855,13 +866,16 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
 
                         #
-                        key_name = "data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
+                        if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
+                        else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
                         self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name, x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]))
                         self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name, x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]))
                         self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name, x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]))
 
                         #
-                        key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_dipole_moment))}"
+                        #key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_dipole_moment))}"
+                        if trained_subset: key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        else:              key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
                         self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
                         self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
                         self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
