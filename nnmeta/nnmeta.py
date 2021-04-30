@@ -57,11 +57,20 @@ import xml.etree.ElementTree as ET
 class GPUInfo:
     gpus       : List = field(default_factory=list)
     idx_in_use : List = field(default_factory=list)
+    notified   : int  = 0
+    _no_nvidia : bool = False
 
     def get_info(self):
         self.gpus.clear()
 
-        p = Popen(["nvidia-smi", "-q", "-x"], stdout=PIPE)
+        try: p = Popen(["nvidia-smi", "-q", "-x"], stdout=PIPE)
+        except Exception as e:
+            if not self._no_nvidia:
+                print(f"No nvidia-smi? {e}")
+                self.gpus.clear()
+                self._no_nvidia = True
+            return
+
         outs, errors = p.communicate()
         root = ET.fromstring(outs)
 
@@ -128,7 +137,7 @@ class GPUInfo:
 
             for gpu in self.gpus:
                 # uuid/ idx
-                if gpu["uuid"] in visible_gpu or gpu["idx"] in visible_gpu: idx.append(gpu["idx"])
+                if gpu["uuid"] in visible_gpu or str(gpu["idx"]) in visible_gpu: idx.append(gpu["idx"])
             self.idx_in_use = idx
         else:
             idx = self.idx_in_use
@@ -142,7 +151,10 @@ class GPUInfo:
         idx = []
         for gpu in self.gpus:
             if len(gpu["processes"]) == 0: idx.append(gpu["idx"])
-        if len(idx) == 0: print("[Warning!] No empty devices!")
+        if len(idx) == 0:
+            if self.notified < 2:
+                print("[Warning!] No empty devices!");
+                self.notified += 1
         return idx
 
     def get_empty_gpu_excluded_G_jobs(self) -> List:
@@ -157,7 +169,10 @@ class GPUInfo:
                 if job["process_type"].upper() == "G": g_type_process_jobs += 1
             number_jobs_without_g_type = len(gpu["processes"]) - g_type_process_jobs
             if number_jobs_without_g_type == 0: idx.append(gpu["idx"])
-        if len(idx) == 0: print("[Warning!] No empty devices even without G type jobs!")
+        if len(idx) == 0:
+            if self.notified < 2:
+                print("[Warning!] No empty devices even without G type jobs!")
+                self.notified += 1
         return idx
 
 ## NNMeta
@@ -195,7 +210,7 @@ class NNClass:
     n_filters                    : int            = 128
     n_gaussians                  : int            = 25
     n_interactions               : int            = 1
-    cutoff                       : int            = 5.0  # angstrems
+    cutoff                       : int            = 5.0  # angstroms
 
     n_layers_energy_force        : int            = 2
     n_layers_dipole_moment       : int            = 2
@@ -366,7 +381,7 @@ class NNClass:
 
     def print_info(self) -> None:
         print_function(f"""
-# # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device}| GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
+# # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device} | GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
         NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
         LEARNING RATE                :   {self.lr}
@@ -562,7 +577,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         if os.path.exists(self.model_path + "/best_model"):
             print_function(f"{self.internal_name} Already trained network exists!")
             print_function(f"Loading...")
-            self.model = torch.load(self.model_path + "/best_model")
+            self.model = spk.utils.load_model(self.model_path + "/best_model", map_location=self.device)
             print_function(f"Model parameters: {self.model}")
 
         else:
@@ -636,7 +651,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             self.model = AtomisticModel(representation, output_modules)
             print_function(f"Model parameters: {self.model}")
 
-            if self.device == "cuda":
+            if self.device == "cuda" and len(self.gpu_info.get_gpu_in_use()) > 1:
                 idx = self.gpu_info.get_gpu_in_use()
                 self.model = torch.nn.DataParallel(self.model)
             print_function(f"{self.internal_name} [model building] done.")
@@ -689,7 +704,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 if epoch % self.predict_each_epoch == 0 and epoch != 0:
                     if not showed: self.gpu_info.notify(True); showed=True
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
-                    self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epoch)
+                    self.predict(indexes=indexes, xyz_file=xyz_file)
                     self.use_model_on_test(db_name=indexes)
 
         print_function(f"{self.internal_name} [model training] done.")
@@ -712,19 +727,19 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.build_model()
 
                 # initial preparations
-                self.build_trainer()
+                if self._should_train: self.build_trainer()
                 #
                 self.name4storer = self.network_name +"_"+xyz_file+"_"+indexes+".nn"
                 if not self.storer.get(self.name4storer): self.storer.put(what=0, name=self.name4storer)
                 print_function(f"--> [Storer]  epochs done: {self.storer.show(get_string=True)}")
-                print_function(f"--> [Trainer] epochs done: {self.trainer.epoch}")
+                if self._should_train: print_function(f"--> [Trainer] epochs done: {self.trainer.epoch}")
 
                 #
                 if self._should_train: self._train(epochs=epochs, indexes=indexes, xyz_file=xyz_file)
                 # Show the last epoch
                 self.gpu_info.notify(True)
                 self.validate()
-                self.predict(indexes=indexes, xyz_file=xyz_file, epochs_done=epochs)
+                self.predict(indexes=indexes, xyz_file=xyz_file)
                 if self._should_train: self.use_model_on_test(db_name=indexes)
 
     def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
@@ -762,14 +777,13 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.plotter_progress.plot(x=x, y=(y-y[0]), key_name=key_name, page="xyz_file_sub")
 
 
-    def predict(self, indexes:str  = None, xyz_file:str = None, epochs_done:int = None, path2foreign_model:str = None) -> None:
+    def predict(self, indexes:str  = None, xyz_file:str = None, path2foreign_model:str = None) -> None:
         """
         Prediction method.
 
         Input:
         - indexes     [None] -- XX:XX:XX indexes for start / end / step
         - xyz_file    [None] -- path to xyz file
-        - epochs_done [None] -- int used in plotting (optional)
         - path2foreign_model [None]  -- if set used for comparing
         """
         if self.meta:
@@ -792,12 +806,13 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             if path2foreign_model is not None:
                 if not self.foreign_plotted: self.foreign_plotted = True
                 network_name = key_prefix = "foreign_model"
-                model_path   = path2foreign_model
+                model_path   = os.path.join(path2foreign_model, 'best_model')
                 #fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
                 epochs_done  = "[UNKNOWN]"
             else:
                 network_name = key_prefix = str(self.network_name)
-                model_path   = self.model_path
+                model_path   = os.path.join(self.model_path, 'best_model') #self.model_path
+                epochs_done  = self.storer.get(self.name4storer)
                 #fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
             # creating folder for model test
@@ -829,7 +844,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     trained_subset = False
 
                 print_function(f"[{network_name}] Loading the last best model")
-                best_model = torch.load(os.path.join(model_path, 'best_model'))
+                best_model = spk.utils.load_model(model_path, map_location=self.device)
 
                 print_function(f"Predicting on subset [#{len(idxs)}]...")
                 self.preds = preds = defaultdict(list)
@@ -845,7 +860,9 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
                 if not self.using_matplotlib and self.plot_enabled:
                     try: sysname = xyz_file.split("_")[1]
-                    except: sysname = "unnamed"
+                    except:
+                        if not trained_subset: sysname = "unnamed"
+                        else: sysname = "data"
 
                     if 'energy' in self.training_properties:
                         pred_energy        = np.array(preds["pred_energy"], dtype=float)
