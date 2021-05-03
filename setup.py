@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name         = 'nnmeta',
-    version      = '1.5.4',
+    version      = '1.5.5',
     author       = 'Alexander D. Kazakov',
     author_email = 'alexander.d.kazakov@gmail.com',
     description  = 'NNMeta based on Schnetpack [https://github.com/atomistic-machine-learning/schnetpack].',
