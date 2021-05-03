@@ -446,7 +446,7 @@ class NNClass:
         Plotting the training progress by the framework.
 
         """
-        energy_loss, forces_loss, dipole_moment_loss = None, None, None
+        energy_loss, forces_loss, dipole_moment_loss = [None], [None], [None]
         with open(os.path.join(self.model_path, 'log.csv')) as flog: head = [next(flog) for line in range(1)]
         titles = head[0].strip().lower().split(",")
         # Load logged results
@@ -806,7 +806,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         else:
             def compute_and_account(best_model, batch, idx):
                 ## move batch to GPU, if necessary
-                #batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(self.device) for k, v in batch.items()}
                 pred = best_model(batch)
                 if "energy"        in self.training_properties:
                     preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
