@@ -1012,35 +1012,36 @@ Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #
         """)
 
         # Plotting
-        network_name = key_prefix = str(self.network_name)
-        epochs_done  = self.storer.get(self.name4storer)
+        if not self.using_matplotlib and self.plot_enabled:
+            network_name = key_prefix = str(self.network_name)
+            epochs_done  = self.storer.get(self.name4storer)
 
-        pred_energy        = np.array(preds["pred_energy"], dtype=float)
-        sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
-        orig_energy        = np.array(preds["orig_energy"], dtype=float)
-        sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
-        # dp
-        pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-        sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
-        orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-        sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
+            pred_energy        = np.array(preds["pred_energy"], dtype=float)
+            sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
+            orig_energy        = np.array(preds["orig_energy"], dtype=float)
+            sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
+            # dp
+            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+            sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
+            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+            sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
 
 
-        # energy
-        key_name = f"{key_prefix} on test dataset: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
-        self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
-                                   x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
-        #
-        # diag
-        self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
-                                   x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
-                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
-        self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
-                                   x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
-                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
-        self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
-                                   x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
-                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+            # energy
+            key_name = f"{key_prefix} on test dataset: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+            self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
+                                       x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
+            #
+            # diag
+            self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
+                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
+                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+            self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
+                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
+                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+            self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
+                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
+                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
 
     def prepare_network(self, redo:bool = False) -> None:
         self.create_model_path(redo=redo)
