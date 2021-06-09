@@ -39,7 +39,7 @@ from schnetpack                 import AtomsLoader
 from schnetpack                 import AtomsData
 from schnetpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
 from schnetpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
-from schnetpack.train           import build_mse_loss
+from schnetpack.train           import build_mse_loss_nd as mse_loss
 from storer                     import Storer
 from collections                import defaultdict
 
@@ -678,11 +678,11 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
         hooks   = [
             CSVHook(log_path=self.model_path, metrics=metrics),
-            ReduceLROnPlateauHook(optimizer, patience=5, factor=0.8, min_lr=1e-6, stop_after_min=True)
+            ReduceLROnPlateauHook(optimizer, patience=15, factor=0.8, min_lr=1e-8, stop_after_min=True)
         ]
 
         # trainer
-        loss = build_mse_loss(self.training_properties, loss_tradeoff=self.loss_tradeoff)
+        loss = mse_loss(self.training_properties, loss_tradeoff=self.loss_tradeoff)
         self.trainer = Trainer(
             model_path        = self.model_path,
             model             = self.model,
