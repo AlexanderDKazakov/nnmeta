@@ -24,7 +24,7 @@
 
 
 from dataclasses import dataclass, field
-from typing      import List, Any
+from typing      import List, Any, Callable
 from torch       import Tensor
 from ase         import Atoms
 from ase.io      import read
@@ -39,7 +39,7 @@ from schnetpack                 import AtomsLoader
 from schnetpack                 import AtomsData
 from schnetpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
 from schnetpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
-from schnetpack.train           import build_mse_loss_nd as mse_loss
+from schnetpack.train           import build_mse_loss, build_mae_loss, build_sae_loss
 from storer                     import Storer
 from collections                import defaultdict
 
@@ -185,7 +185,7 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.5.8"
+    __version__                  : str            = "1.5.9"
     debug                        : bool           = False
     _should_train                : bool           = True
 
@@ -203,6 +203,8 @@ class NNClass:
     training_properties          : tuple          = ("energy", "forces", "dipole_moment")  # properties used for training
     db_epochs                    : dict           = field(default_factory=dict)
     training_progress            : dict           = field(default_factory=dict)
+    loss_function_choice         : str            = "mse" # Available: ["mse", "mae", "sae", .?.]
+    loss_fun_builder             : Callable       = None
     #
     redo_split_file              : bool           = False
     foreign_plotted              : bool           = False
@@ -223,12 +225,12 @@ class NNClass:
     n_neurons_energy_force       : int            = None
     n_neurons_dipole_moment      : int            = None
     _n_output_dipole_moment      : int            = 3
-    dipole_moment_vector         : bool           = False
+    is_dipole_moment_magnitude   : bool           = False
 
     #
     using_matplotlib             : bool           = False
     compare_with_foreign_model   : bool           = False
-    visualize_points_from_nn     : int            = 100
+    # visualize_points_from_nn     : int            = 100  # DEPRECATED // REMOVE IN NEXT VERSION
     visualize_points_from_data   : int            = 100
     #
     samples                      : List[Atoms]    = None
@@ -242,15 +244,15 @@ class NNClass:
     valid_samples                : np.array       = None
     test_samples                 : np.array       = None
 
-    number_training_examples_percent  : float     = 60.0
-    number_validation_examples_percent: float     = 20.0
+    train_samples_percent        : float     = 60.0
+    valid_samples_percent        : float     = 20.0
 
     units_dimensions = dict(
         ENERGY        = "Hartree",
         FORCE         = "Hartree/Bohr",
         DIPOLE_MOMENT = "Debye"
     )
-    check_list_files = {}
+    check_list_files              : dict          = field(default_factory=dict)
 
     def __post_init__(self):
         if self.system_path[-1] != "/": self.system_path+="/"
@@ -303,16 +305,16 @@ class NNClass:
         if self.info[kf].get("n_layers_dipole_moment"):                 self.n_layers_dipole_moment             = self.info[kf].get("n_layers_dipole_moment")
         if self.info[kf].get("n_neurons_dipole_moment"):                self.n_neurons_dipole_moment            = self.info[kf].get("n_neurons_dipole_moment")
 
-        if self.info[kf].get("number_training_examples_percent"):       self.number_training_examples_percent   = self.info[kf].get("number_training_examples_percent")
-        if self.info[kf].get("number_validation_examples_percent"):     self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent")
+        if self.info[kf].get("train_samples_percent"):                  self.train_samples_percent              = self.info[kf].get("train_samples_percent")
+        if self.info[kf].get("valid_samples_percent"):                  self.valid_samples_percent              = self.info[kf].get("valid_samples_percent")
 
         if self.info[kf].get("visualize_points_from_data"):             self.visualize_points_from_data         = self.info[kf].get("visualize_points_from_data")
-        if self.info[kf].get("visualize_points_from_nn"):               self.visualize_points_from_nn           = self.info[kf].get("visualize_points_from_nn")
 
-        if self.info[kf].get("units_dimensions"):                       self.units_dimensions                   = self.info[kf].get("units_dimensions")
         if self.info[kf].get("check_list_files"):                       self.check_list_files                   = self.info[kf].get("check_list_files")
+        if self.info[kf].get("loss_function_choice"):                   self.loss_function_choice               = self.info[kf].get("loss_function_choice")
 
         self.check_provided_parameters()
+        self._import_relevant_loss()
         print_function(f"{self.internal_name} [v.{self.__version__}] | System path: {self.system_path}")
         if self.debug: print_function(f"<<<Debug call>>>\n {str(self)}"); sys.exit(0)
 
@@ -338,7 +340,7 @@ class NNClass:
                 pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units_dimensions['ENERGY']}]",)
                 pages_info["forces_loss"]  = dict(xname="Time [s]", yname=f"Force  LOSS [{self.units_dimensions['FORCE']}]",)
 
-            if "dipole_moment" in self.training_properties:
+            if "dipole_moment" in self.training_properties or "dipole_moment_magnitude" in self.training_properties:
                 # framework
                 pages_info["dipole_moment_loss"]    = dict(xname="[sample number]", yname=f"Dipole moment LOSS [{self.units_dimensions['DIPOLE_MOMENT']}]",)
                 #
@@ -367,19 +369,28 @@ class NNClass:
                     pages_info["delta_dipole_moment_z"] = dict(xname="[sample number]",
                                                                yname=f"\\Delta Dipole moment [z] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
 
-            self.plotter_progress = Plotter(title="Check Results", pages_info=pages_info)
-            self.plotter_log = Plotter(title="", engine="gnuplot")
+            self.plotter_progress = Plotter(title="Check Results", pages_info=pages_info, keyFontSize = 8)
+            self.plotter_log      = Plotter(title="", engine="gnuplot")
 
 
     def check_provided_parameters(self) -> None:
         ok = True; mess = ""
         # 1
-        if (self.number_training_examples_percent + self.number_validation_examples_percent) >= 100:
+        if (self.train_samples_percent + self.valid_samples_percent) >= 100:
             ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
         # 2...
 
         if not ok: print_function(mess); sys.exit(1)
 
+    def _import_relevant_loss(self) -> None:
+        if   self.loss_function_choice == "mse": self.loss_fun_builder = build_mse_loss
+        elif self.loss_function_choice == "mae": self.loss_fun_builder = build_mae_loss
+        elif self.loss_function_choice == "sae": self.loss_fun_builder = build_sae_loss
+        else:
+            print(f"Waring! Loss function choice is not covered, MSE loss function will be in use!\n [Your choice is {self.loss_function_choice}]...")
+            self.loss_fun_builder = build_mse_loss
+
+# DEPRECATED // REMOVE IN NEXT VERSION
     @staticmethod
     def loss_function(batch: Any, result: Any) -> Tensor:
         # tradeoff
@@ -410,27 +421,28 @@ class NNClass:
     def print_info(self) -> None:
         print_function(f"""
 # # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device} | GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
-        NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
-        NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
-        LEARNING RATE                :   {self.lr}
-        N INTERACTION                :   {self.n_interactions}
-        LOSS TRADEOFF                :   {self.loss_tradeoff}
-        TRAINING PROPERTIES          :   {self.training_properties}
+        NUMBER TRAINING EXAMPLES  [%]/# :   {self.train_samples_percent}
+        NUMBER VALIDATION EXAMPLES[%]/# :   {self.valid_samples_percent}
+        LEARNING RATE                   :   {self.lr}
+        N INTERACTION                   :   {self.n_interactions}
+        LOSS TRADEOFF                   :   {self.loss_tradeoff}
+        LOSS FUNCTION CHOICE            :   {self.loss_function_choice}
+        TRAINING PROPERTIES             :   {self.training_properties}
 
-        ENERGY UNITS                 :   [{self.units_dimensions["ENERGY"]}]
-        FORCE UNITS                  :   [{self.units_dimensions["FORCE"]}]
-        DIPOLE MOMENT UNITS          :   [{self.units_dimensions["DIPOLE_MOMENT"]}]
-            DIPOLE_MOMENT MAGNITUDE  :   [{self.is_dipole_moment_magnitude}]
+        ENERGY UNITS                    :   [{self.units_dimensions["ENERGY"]}]
+        FORCE UNITS                     :   [{self.units_dimensions["FORCE"]}]
+        DIPOLE MOMENT UNITS             :   [{self.units_dimensions["DIPOLE_MOMENT"]}]
+            DIPOLE_MOMENT MAGNITUDE     :   [{self.is_dipole_moment_magnitude}]
 
         DB INFO:
-            PROPERTIES               :   {self.db_properties}
-            [INDEXES : EPOCHS]       :   {self.db_epochs.items()}
+            PROPERTIES                  :   {self.db_properties}
+            [INDEXES : EPOCHS]          :   {self.db_epochs.items()}
 
         PATHS:
-            XYZ                      :   {self.xyz_path}
-            DB                       :   {self.db_path}
-            MODEL [GENERAL]          :   {self.general_models_path}
-            SPLITS                   :   {self.split_path}
+            XYZ                         :   {self.xyz_path}
+            DB                          :   {self.db_path}
+            MODEL [GENERAL]             :   {self.general_models_path}
+            SPLITS                      :   {self.split_path}
 
         """)
         self.storer.show()
@@ -484,12 +496,14 @@ class NNClass:
         if 'energy'        in self.training_properties: energy_loss        = self.training_progress['energy']
         if 'forces'        in self.training_properties: forces_loss        = self.training_progress['forces']
         if 'dipole_moment' in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment']
+        if "dipole_moment_magnitude" in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment_magnitude']
+
 
         # Get final validation errors
         print_function(f"""
 
 Validation LOSS | epochs {self.storer.get(self.name4storer)}:
-          <energy> [{self.units_dimensions['ENERGY']}]: {str(energy_loss[-1]):>15}
+          <energy> [{self.units_dimensions['ENERGY']}]: {str(energy_loss[-1]):>25}
           <forces> [{self.units_dimensions['FORCE']}]: {str(forces_loss[-1]):>15}
           <dipole moment> [{self.units_dimensions['DIPOLE_MOMENT']}]: {str(dipole_moment_loss[-1]):>15}
 
@@ -500,7 +514,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             if not self.using_matplotlib:
                 if 'energy'        in self.training_properties: self.plotter_progress.plot(x=time, y=energy_loss,        key_name="", page="energy_loss")
                 if 'forces'        in self.training_properties: self.plotter_progress.plot(x=time, y=forces_loss,        key_name="", page="forces_loss")
-                if 'dipole_moment' in self.training_properties: self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
+                if 'dipole_moment' in self.training_properties or 'dipole_moment_magnitude' in self.training_properties:
+                    self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
             else:
                 # Matplotlib instructions
                 plt.figure(figsize=(14,5))
@@ -555,9 +570,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 if 'dipole_moment' in self.db_properties:
                     try:
                         dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float32)
-                        _['dipole_moment'] = dipole_moment
-                        _['dipole_moment_magnitude'] = np.linalg.norm(dipole_moment)
-
+                        _['dipole_moment']           = dipole_moment
+                    except Exception as e: print_function(f"[Warning]: {e}")
+                if 'dipole_moment_magnitude' in self.db_properties:
+                    try:
+                        dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float32)
+                        _['dipole_moment_magnitude'] = np.array([np.linalg.norm(dipole_moment)], dtype=np.float32)
                     except Exception as e: print_function(f"[Warning]: {e}")
                 property_list.append(_)
 
@@ -580,11 +598,11 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         print_function(f"->>> 1 sample[{atoms.symbols}]")
         print('->>> [DB] Properties:\n', *[' -- {:s}\n'.format(key) for key in props.keys()])
 
-        number_training_examples   = int(len(self.samples) * (self.number_training_examples_percent   / 100))
-        number_validation_examples = int(len(self.samples) * (self.number_validation_examples_percent / 100))
+        number_train_samples:int = int(len(self.samples) * (self.train_samples_percent / 100))
+        number_valid_samples:int = int(len(self.samples) * (self.valid_samples_percent / 100))
 
         # creating path_file
-        self.split_path_file = os.path.join(self.split_path, f"{db_name}_split_Ntrain{number_training_examples}_Nvalid{number_validation_examples}_{self.network_name}.npz")
+        self.split_path_file = os.path.join(self.split_path, f"{db_name}_split_Ntrain{number_train_samples}_Nvalid{number_valid_samples}_{self.network_name}.npz")
 
         # removing if redo
         if self.redo_split_file:
@@ -595,8 +613,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         # split train validation testf
         self.train_samples, self.valid_samples, self.test_samples = spk.train_test_split(
             data       = self.samples,
-            num_train  = number_training_examples,
-            num_val    = number_validation_examples,
+            num_train  = number_train_samples,
+            num_val    = number_valid_samples,
             split_file = self.split_path_file,  # WARNING! if the file exists it will be loaded.
         )
 
@@ -667,7 +685,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 )
                 output_modules.append(ENERGY_FORCE)
 
-            if "dipole_moment" in self.training_properties:
+            if "dipole_moment" in self.training_properties or "dipole_moment_magnitude" in self.training_properties:
 
                 DIPOLE_MOMENT = spk.atomistic.DipoleMoment(
                     n_in              = representation.n_atom_basis,
@@ -677,7 +695,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     activation        = spk.nn.activations.shifted_softplus,
                     property          = "dipole_moment_magnitude" if self.is_dipole_moment_magnitude else "dipole_moment",
                     contributions     = None,
-                    predict_magnitude = False,
+                    predict_magnitude = True if self.is_dipole_moment_magnitude else False,
                     mean              = None,
                     stddev            = None,
                 )
@@ -707,12 +725,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         ]
 
         # trainer
-        loss = mse_loss(self.training_properties, loss_tradeoff=self.loss_tradeoff)
+        loss_fun = self.loss_fun_builder(self.training_properties, loss_tradeoff=self.loss_tradeoff)
         self.trainer = Trainer(
             model_path        = self.model_path,
             model             = self.model,
             hooks             = hooks,
-            loss_fn           = loss,
+            loss_fn           = loss_fun,
             optimizer         = optimizer,
             train_loader      = self.train_loader,
             validation_loader = self.valid_loader,
@@ -812,27 +830,32 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 _, props = source_of_points.get_properties(idx)
                 samples2show.append(np.array(props[training_prop])) #
 
-            self.CHECK = y = np.array(samples2show)
+            y = np.array(samples2show)
             x = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, samples4showing)]
             assert(len(y) == len(x), "Strange it x-y lengths are different")
             if not self.using_matplotlib:
                 key_name = "data: train/showed:["+str(num_samples)+"/"+str(samples4showing)+"] total:" + str(len(self.samples))
 
-                # dipole_moment_x, dipole_moment_y, dipole_moment_z
-                if y.shape[1] > 1:
-                    for dim in range(y.shape[1]):
-                        try: page = DM[dim]
-                        except ValueError:
-                            print(f"DM does not know the page for dim: {dim}. Aborting.")
-                            sys.exit(1)
-                        self.plotter_progress.plot(x=x, y=y[:,dim], key_name=key_name, page=page)
+                # dipole moments
+                if "dipole" in training_prop:
+                    # dipole_moment_x, dipole_moment_y, dipole_moment_z
+                    if y.shape[1] > 1:
+                        for dim in range(y.shape[1]):
+                            try: page = DM[dim]
+                            except ValueError:
+                                print(f"DM does not know the page for dim: {dim}. Aborting.")
+                                sys.exit(1)
+                            self.plotter_progress.plot(x=x, y=y[:,dim], key_name=key_name, page=page)
+                    else:
+                        ### dipole_moment_magnitude
+                        self.plotter_progress.plot(x=x, y=y[:,0], key_name=key_name, page="dipole_moment_magnitude")
                 else:
                     # energy
                     self.plotter_progress.plot(x=x, y=y[:,0],             key_name=key_name, page="xyz_file")
                     self.plotter_progress.plot(x=x, y=(y[:,0]-y[:,0][0]), key_name=key_name, page="xyz_file_sub")
 
 
-    def predict(self, indexes:str  = None, xyz_file:str = None, path2foreign_model:str = None) -> None:
+    def predict(self, indexes:str  = None, xyz_file:str = None, path2foreign_model:str = None, need2plot:bool = True) -> None:
         """
         Prediction method.
 
@@ -855,24 +878,22 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 if "energy"        in self.training_properties:
                     preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
                     preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
-
                 if "dipole_moment" in self.training_properties:
-                    if self.is_dipole_moment_magnitude:
-                        preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
-                        preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
-                    else:
-                        preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
-                        preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+                    preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
+                    preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+                if "dipole_moment_magnitude" in self.training_properties:
+                    preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
+                    preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
 
             if path2foreign_model is not None:
                 if not self.foreign_plotted: self.foreign_plotted = True
-                network_name = key_prefix = "foreign_model"
+                network_name = key_prefix = "foreign model"
                 model_path   = os.path.join(path2foreign_model, 'best_model')
                 #fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
                 epochs_done  = "[UNKNOWN]"
             else:
                 network_name = key_prefix = str(self.network_name)
-                model_path   = os.path.join(self.model_path, 'best_model') #self.model_path
+                model_path   = os.path.join(self.model_path, 'best_model')
                 epochs_done  = self.storer.get(self.name4storer)
                 #fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
@@ -899,10 +920,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
                     subsamples, idxs = spk.get_subset(
                         data         = samples,
-                        num_samples  = self.visualize_points_from_nn,
+                        num_samples  = self.check_list_files[xyz_file]['num_points'], #self.visualize_points_from_nn,
                     )
                     subsamples_loader = AtomsLoader(subsamples, batch_size=1)
                     trained_subset = False
+                    # use model on test
+                    self.use_model_on_test(_subsamples_loader = subsamples_loader, need2plot=False)
 
                 print_function(f"[{network_name}] Loading the last best model")
                 best_model = spk.utils.load_model(model_path, map_location=self.device)
@@ -910,16 +933,15 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 print_function(f"Predicting on subset [#{len(idxs)}]...")
                 self.preds = preds = defaultdict(list)
 
-                if len(subsamples_loader) == self.visualize_points_from_nn:
+                if not trained_subset: #len(subsamples_loader) == self.visualize_points_from_nn:
                     for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")): compute_and_account(best_model, batch, idxs[idx])
                 else:
                     for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")):
                         if idx in idxs: compute_and_account(best_model, batch, idx)
 
                 ## Plotting
-
-                if not self.using_matplotlib and self.plot_enabled:
-                    try: sysname = xyz_file
+                if (self.plot_enabled and not self.using_matplotlib) and need2plot:
+                    try: sysname = xyz_file.replace("_", " ")
                     except:
                         if not trained_subset: sysname = "unnamed"
                         else: sysname = "data"
@@ -930,8 +952,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         orig_energy        = np.array(preds["orig_energy"], dtype=float)
                         sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
 
-                        if trained_subset: key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
-                        else:              key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        if trained_subset: key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        else:              key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
                         self.plotter_progress.plot(page="xyz_file",     key_name = key_name,
                                                    x=sorted_pred_energy[:,0], y=sorted_pred_energy[:,1],  animation=True)
                         self.plotter_progress.plot(page="xyz_file_sub", key_name = key_name,
@@ -942,83 +964,88 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
                                                    x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
 
+                    if 'dipole_moment_magnitude' in self.training_properties:
+                        pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=float)
+                        sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment[:,0].argsort()]
+                        orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=float)
+                        sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment[:,0].argsort()]
+
+                        if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
+                        else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
+
+                        # original
+                        self.plotter_progress.plot(page="dipole_moment_magnitude", key_name=key_name,
+                                                   x=sorted_orig_dipole_moment[:,0],
+                                                   y=sorted_orig_dipole_moment[:,1])
+
+                        self.plotter_progress.plot(page="delta_dipole_moment_magnitude", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment[:,0],
+                                                   y=(sorted_pred_dipole_moment[:,1]-sorted_orig_dipole_moment[:,1]))
+
+                        self.plotter_progress.plot(page="diag_dp_magnitude", key_name = key_name, plotLine=False,
+                                                   x=sorted_orig_dipole_moment[:,1],
+                                                   y=sorted_pred_dipole_moment[:,1])
+
                     if 'dipole_moment' in self.training_properties:
+                        # not a magnitude --> [x, y ,z]
+                        pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                        sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
+                        orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                        sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
 
-                        if self.is_dipole_moment_magnitude:
-                            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=float)
-                            sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment[:,0].argsort()]
-                            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=float)
-                            sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment[:,0].argsort()]
+                        # original --> [x,y,z]
+                        if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
+                        else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
+                        self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name,
+                                                   x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]))
+                        self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name,
+                                                   x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]))
+                        self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name,
+                                                   x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]))
 
-                            if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
-                            else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
-                            # original
-                            self.plotter_progress.plot(page="dipole_moment_magnitude", key_name=key_name,
-                                                       x=sorted_orig_dipole_moment[:,0],
-                                                       y=np.concatenate(sorted_orig_dipole_moment[:,1]))
+                        #
+                        #key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_dipole_moment))}"
+                        if trained_subset: key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(sorted_orig_dipole_moment['idx']))}"
+                        else:              key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(sorted_orig_dipole_moment['idx']))}"
+                        self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+                        self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+                        self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
 
-                            self.plotter_progress.plot(page="delta_dipole_moment_magnitude", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment[:,0],
-                                                       y=(np.concatenate(sorted_pred_dipole_moment[:,1])-np.concatenate(sorted_orig_dipole_moment[:,1])))
+                        # delta  --> [x,y,z]
+                        self.plotter_progress.plot(page="delta_dipole_moment_x", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,0])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,0])) )
+                        self.plotter_progress.plot(page="delta_dipole_moment_y", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,1])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,1])) )
+                        self.plotter_progress.plot(page="delta_dipole_moment_z", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,2])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,2])) )
 
-                            self.plotter_progress.plot(page="diag_dp_magnitude", key_name = key_name, plotLine=False,
-                                                       x=np.concatenate(sorted_orig_dipole_moment[:,1]),
-                                                       y=np.concatenate(sorted_pred_dipole_moment[:,1]))
-
-                        else:
-                            # not a magnitude --> [x, y ,z]
-                            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-                            sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
-                            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-                            sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
-
-                            # original
-                            if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
-                            else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
-                            self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name,
-                                                       x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]))
-                            self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name,
-                                                       x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]))
-                            self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name,
-                                                       x=sorted_orig_dipole_moment["idx"], y=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]))
-
-                            #
-                            #key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_dipole_moment))}"
-                            if trained_subset: key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(sorted_orig_dipole_moment['idx']))}"
-                            else:              key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(sorted_orig_dipole_moment['idx']))}"
-                            self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
-                            self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
-                            self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
-
-                            # delta
-                            self.plotter_progress.plot(page="delta_dipole_moment_x", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,0])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,0])) )
-                            self.plotter_progress.plot(page="delta_dipole_moment_y", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,1])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,1])) )
-                            self.plotter_progress.plot(page="delta_dipole_moment_z", key_name=key_name,
-                                                       x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,2])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,2])) )
-
-                            # diag
-                            self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
-                                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
-                                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
-                            self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
-                                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
-                                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
-                            self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
-                                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
-                                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+                        # diag --> [x,y,z]
+                        self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
+                                                   x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+                        self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
+                                                   x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+                        self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
+                                                   x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
 
 
-    def use_model_on_test(self, db_name:str = None, path2model:str = None,) -> None:
+    def use_model_on_test(self, db_name:str = None, path2model:str = None, _subsamples_loader:AtomsLoader = None, need2plot:bool = True) -> None:
+        """
+        The function provides ability to use model [trained/foreign] on the test data and plot results (if necessary (need2plot flag))
+
         """
 
-        The function provides ability to use model [trained/foreign] on the test data.
-
-        """
         def compute_and_account(best_model, batch, idx):
             ## move batch to GPU, if necessary
             batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -1030,13 +1057,11 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 preds["orig_forces"].append((idx, batch["forces"].detach().cpu().numpy() ))
                 preds["pred_forces"].append((idx, pred["forces"].detach().cpu().numpy()) )
             if "dipole_moment" in self.training_properties:
-
-                if self.is_dipole_moment_magnitude:
-                    preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
-                    preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
-                else:
-                    preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
-                    preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+                preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
+                preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+            if "dipole_moment_magnitude" in self.training_properties:
+                preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
+                preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
 
         which = "trained" if path2model is None else "[FOREIGN]"
         if path2model is None: best_model = self.model
@@ -1050,7 +1075,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
         if self.test_loader is None: self.prepare_train_valid_test_samples(db_name=db_name)
 
-        subsamples_loader  = AtomsLoader(self.test_samples, batch_size=1)
+        if _subsamples_loader is not None: subsamples_loader = _subsamples_loader
+        else:                              subsamples_loader = AtomsLoader(self.test_samples, batch_size=1)
 
         self.test_preds = preds = defaultdict(list)
 
@@ -1065,43 +1091,61 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             energy_error = np.sum( np.abs(pred_energy['val'] - orig_energy['val']) ) / samples_to_account
 
             # and force
-            pred_forces = np.array(preds["pred_forces"], dtype=[('idx', 'i8'), ('xyz', 'f8', (192, 3))])
-            orig_forces = np.array(preds["orig_forces"], dtype=[('idx', 'i8'), ('xyz', 'f8', (192, 3))])
+            # --> structure:
+            #                 [idx, array(X,...,X)]
+            #                            ...
+            #                 [idx, array(X,...,X)] <-- second element is np.array
 
-            forces_error = torch.Tensor ( np.mean ( np.mean( np.abs(pred_forces['xyz'] - orig_forces['xyz']), axis=(0,) ), axis=(0,) ) )
+            # checking if an array is heterogeneous
+            heterogeneous_array = False
+            fi = preds['pred_forces'][0][1].shape[1]  # second item of the shape
+            for item in preds['pred_forces']:
+                if fi != item[1].shape[1]: heterogeneous_array = True
 
+            if heterogeneous_array:
+                nparrs_list: List[np.array] = []
+                for idx, _ in enumerate(preds['pred_forces']):
+                    # [mean_over_X, mean_over_Y, mean_over_Z] <-- list of this
+                    nparrs_list.append( np.mean( np.abs(preds['pred_forces'][idx][1] - preds['orig_forces'][idx][1])[0], axis=(0,) ) )
+                forces_error = torch.Tensor( np.mean(nparrs_list, axis=(0,)) )
+            else:
+                # <Warning> In heterogeneous arrays this trick does not work!
+                row_size    = preds['pred_forces'][0][1].shape[1]  # 1 --> second dim
+                pred_forces = np.array(preds["pred_forces"], dtype=[('idx', 'i8'), ('xyz', 'f8', (row_size, 3))])
+                orig_forces = np.array(preds["orig_forces"], dtype=[('idx', 'i8'), ('xyz', 'f8', (row_size, 3))])
+                forces_error = torch.Tensor ( np.mean ( np.mean( np.abs(pred_forces['xyz'] - orig_forces['xyz']), axis=(0,) ), axis=(0,) ) )
 
         if "dipole_moment" in self.training_properties:
+            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
 
-            if self.is_dipole_moment_magnitude:
-                pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8')])
-                orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8')])
-
-                # np.array:[[<axis_mean_x>, <axis_mean_y>, <axis_mean_z>]]
-                dipole_moment_error = torch.Tensor( np.mean(np.abs(pred_dipole_moment['xyz'] - orig_dipole_moment['xyz']), axis=(0,))[0]) # take internal array [[internal]]
-            else:
-
-                pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-                orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-
-                # np.array:[[<axis_mean_x>, <axis_mean_y>, <axis_mean_z>]]
-                dipole_moment_error = torch.Tensor( np.mean(np.abs(pred_dipole_moment['xyz'] - orig_dipole_moment['xyz']), axis=(0,))[0]) # take internal array [[internal]]
+            # np.array:[[<axis_mean_x>, <axis_mean_y>, <axis_mean_z>]]
+            dipole_moment_error = torch.Tensor( np.mean(np.abs(pred_dipole_moment['xyz'] - orig_dipole_moment['xyz']), axis=(0,))[0]) # take internal array [[internal]]
             samples_to_account = len(orig_dipole_moment)
 
+        if "dipole_moment_magnitude" in self.training_properties:
+            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=float)
+            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=float)
+
+            # np.array: <axis_mean>
+            dipole_moment_error = torch.Tensor([np.mean(np.abs(pred_dipole_moment[:,1] - orig_dipole_moment[:,1]), axis=(0,))]) # Tensor[internal]
+            samples_to_account = len(orig_dipole_moment)
+
+        # TODO: 24?
         print_function(f"""
 
 Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #{samples_to_account}:
-          <energy> [{self.units_dimensions["ENERGY"]}]: {str(energy_error):>25}
+          <energy> [{self.units_dimensions["ENERGY"]}]: {str(energy_error):>24}
           <forces> [{self.units_dimensions["FORCE"]}]: {str(forces_error):>25}
           <dipole moment> [{self.units_dimensions["DIPOLE_MOMENT"]}]: {str(dipole_moment_error):>25}
 
         """)
 
         # Plotting
-        if not self.using_matplotlib and self.plot_enabled:
+        if (self.plot_enabled and not self.using_matplotlib) and need2plot:
             network_name = key_prefix = str(self.network_name)
             epochs_done  = self.storer.get(self.name4storer)
-            key_name = f"{key_prefix}_on_test_dataset:_epochs:{str(epochs_done)}_|_predicted:_"
+            key_name = f"{key_prefix.replace('_','')} on test dataset: epochs:{str(epochs_done)} | predicted:"
 
             if "energy" in self.training_properties:
                 # energy
@@ -1116,33 +1160,32 @@ Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #
                                            x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
 
             if "dipole_moment" in self.training_properties:
+                pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
+                orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
+                # diag
+                key_name += f"{len(pred_dipole_moment)}"
+                self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
+                                           x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
+                                           y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+                self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
+                                           x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
+                                           y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+                self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
+                                           x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
+                                           y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
 
-                if self.is_dipole_moment_magnitude:
-                    pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8')])
-                    sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
-                    orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8')])
-                    sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
-                    # diag
-                    key_name += f"{len(pred_dipole_moment)}"
-                    self.plotter_progress.plot(page="diag_dp_magnitude", key_name = key_name, plotLine=False,
-                                               x=np.concatenate(sorted_orig_dipole_moment["xyz"]),
-                                               y=np.concatenate(sorted_pred_dipole_moment["xyz"]))
-                else:
-                    pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-                    sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
-                    orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-                    sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
-                    # diag
-                    key_name += f"{len(pred_dipole_moment)}"
-                    self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
-                                               x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
-                                               y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
-                    self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
-                                               x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
-                                               y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
-                    self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
-                                               x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
-                                               y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+            if "dipole_moment_magnitude" in self.training_properties:
+                pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=float)
+                sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment[:,0].argsort()]
+                orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=float)
+                sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment[:,0].argsort()]
+                # diag
+                key_name += f"{len(pred_dipole_moment)}"
+                self.plotter_progress.plot(page="diag_dp_magnitude", key_name = key_name, plotLine=False,
+                                           x=sorted_orig_dipole_moment[:,1],
+                                           y=sorted_pred_dipole_moment[:,1])
 
     def prepare_network(self, redo:bool = False) -> None:
         self.create_model_path(redo=redo)
