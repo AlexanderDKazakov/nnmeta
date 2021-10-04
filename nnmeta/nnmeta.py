@@ -64,6 +64,7 @@ AVAILABLE_ENERGY_UNITS = ["hartree", "kj/mol", "kcal/mol", "ev"]
 AVAILABLE_FORCE_UNITS  = ["bohr", "angstrom"]
 AVAILABLE_DM_UNITS     = ["debye"]
 
+
 CONVERTER = {
     # ENERGY
     # from
@@ -471,11 +472,14 @@ class NNClass:
                 db_list.append(db_fname)
         return db_list
 
+    def _get_db_name(self, xyz_file: str,  indexes: str) -> str:
+            return f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+
     def print_info(self) -> None:
         print_function(f"""
 # # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device.type} | GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]/# :   {self.train_samples_percent}/{self._number_train_samples}
-        NUMBER VALIDATION EXAMPLES[%]   :   {self.valid_samples_percent}/{self._number_valid_samples}
+        NUMBER VALIDATION EXAMPLES[%]/# :   {self.valid_samples_percent}/{self._number_valid_samples}
         LEARNING RATE                   :   {self.lr}
         N INTERACTION                   :   {self.n_interactions}
         LOSS TRADEOFF                   :   {self.loss_tradeoff}
@@ -598,12 +602,14 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 print_function(f"     {db_fname} removed.")
 
         print_function(f"{self.internal_name} Checking databases...")
-        db_path_fname = os.path.join(self.db_path, xyz_file + "_"+ str(index) + ".db")
-        if os.path.exists(db_path_fname): print_function(f" ==> {xyz_file + '_' + str(index) + '.db'} [OK]")
+        db_fname      = self._get_db_name(xyz_file=xyz_file, indexes=index)
+        db_path_fname = os.path.join(self.db_path, db_fname)
+
+        if os.path.exists(db_path_fname): print_function(f" ==> {db_fname} [OK]")
         else:
             # no databases is found
             print_function(f"{self.internal_name} Preparing databases...")
-            print_function(f"Creating db with indexes: {index}")
+            print_function(f"Creating {db_path_fname} with indexes: {index}")
             property_list = []
             samples = read(self.xyz_path + xyz_file, index=index, format="extxyz")
             for sample in tqdm(samples, "Preparing database..."):
@@ -684,6 +690,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
     def build_model(self) -> None:
         print_function(f"{self.internal_name} Checking the model...")
+        map_location = self.device
         if len(self.gpu_info.get_gpu_in_use()) == 0: self.device = map_location =  torch.device("cpu")
         if self._force_gpu:
             self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -826,7 +833,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     if not showed: self.gpu_info.notify(True); showed=True
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
                     self.predict(indexes=indexes, xyz_file=xyz_file)
-                    self.use_model_on_test(db_name=indexes)
+                    self.use_model_on_test(db_name=self._get_db_name(xyz_file=xyz_file, indexes=indexes))
 
         print_function(f"{self.internal_name} [model training] done.")
 
@@ -841,7 +848,9 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             for indexes, epochs in self.db_epochs[xyz_file].items():
                 print_function(f"Indexes: {indexes}")
                 self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
-                self.prepare_train_valid_test_samples(db_name = xyz_file+"_"+indexes+".db")
+                db_name = self._get_db_name(xyz_file=xyz_file, indexes=indexes)
+                self.prepare_train_valid_test_samples(db_name = db_name)
+
                 if self.plot_enabled: self.visualize_interest_region(indexes=indexes, samples4showing=self.visualize_points_from_data, source_of_points=self.train_samples)
 
                 # creating model instance: creating representation, output_modules for it
@@ -851,9 +860,9 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 # initial preparations
                 if self._should_train: self.build_trainer()
                 #
-                self.name4storer = self.network_name +"_"+xyz_file+"_"+indexes+".nn"
+                self.name4storer = f"{self.network_name}_{db_name}.nn"
                 if not self.storer.get(self.name4storer): self.storer.put(what=0, name=self.name4storer)
-                print_function(f"--> [Storer]  epochs done: {self.storer.show(get_string=True)}")
+                print_function(f"--> [Storer]  epochs done: {self.storer.get(self.name4storer)}")
                 if self._should_train: print_function(f"--> [Trainer] epochs done: {self.trainer.epoch}")
 
                 #
@@ -862,14 +871,15 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.gpu_info.notify(True)
                 self.validate()
                 self.predict(indexes=indexes, xyz_file=xyz_file)
-                self.use_model_on_test(db_name=indexes)
+                self.use_model_on_test(db_name=db_name)
 
     def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
         print_function(f"{self.internal_name} Visualizing regions of interest...")
         # visualization whole range of points
         if xyz_file:
             self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
-            source_of_points = AtomsData(self.db_path + xyz_file+"_"+indexes+".db", load_only=self.training_properties)
+            #db_name = f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+            source_of_points = AtomsData(self.db_path + self._get_db_name(xyz_file=xyz_file, indexes=indexes), load_only=self.training_properties)
         # end
         num_samples = len(source_of_points)
 
@@ -976,7 +986,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 #
                 print_function(f"Reading {xyz_file}...")
                 self.prepare_databases(redo=False, index=":", xyz_file=xyz_file)
-                db_path_fname = os.path.join(self.db_path, xyz_file + "_:.db")
+                #db_name = f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+                db_path_fname = os.path.join(self.db_path, self._get_db_name(xyz_file=xyz_file, indexes=indexes))
                 print_function(f"Loading... | {db_path_fname}")
                 #
                 if xyz_file in self.db_epochs.keys():
