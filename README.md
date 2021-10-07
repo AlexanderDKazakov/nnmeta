@@ -57,13 +57,13 @@ info = dict(
 	},
 	
 	runner_features = dict(
-		n_features              = 64,   # details in NN class [default is 128]
-		n_filters               = 32,
+		n_features              = 64,    # details in NN class [default is 128]
+		n_filters               = 32,    #
 		n_gaussians             = 12,    # default 25
-		batch_size              = 512,                         [parameter for tuning]
+		batch_size              = 512,   #                     [parameter for tuning]
 		lr                      = 1e-4,  # learning rate       [parameter for tuning]
 		db_properties           = ("energy", "forces", "dipole_moment"), # what can be found in the `samples.xyz` file
-		training_properties     = ("energy", "forces", "dipole_moment"),
+		training_properties     = ("energy", "forces", "dipole_moment"), # what one wants to train
 		loss_tradeoff           = (0.2, 0.8, 0.6),
 		n_layers_energy_force   = 2,     # default 2           [parameter for tuning]
 		n_neurons_energy_force  = None,  # default None        [parameter for tuning]
