@@ -22,7 +22,6 @@
 ## SOFTWARE.
 ##*
 
-
 from dataclasses import dataclass, field
 from typing      import List, Any, Callable
 from torch       import Tensor
@@ -30,19 +29,19 @@ from ase         import Atoms
 from ase.io      import read
 from ase.units   import Bohr,kJ,Hartree,mol,kcal
 
-import numpy      as np
-import schnetpack as spk
+import numpy   as np
+import netpack as pack
 
 import torch
 import os, sys, shutil, re
-from schnetpack.atomistic.model import AtomisticModel
-from schnetpack                 import AtomsLoader
-from schnetpack                 import AtomsData
-from schnetpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
-from schnetpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
-from schnetpack.train           import build_mse_loss, build_mae_loss, build_sae_loss
-from storer                     import Storer
-from collections                import defaultdict
+from netpack.atomistic.model import AtomisticModel
+from netpack                 import AtomsLoader
+from netpack                 import AtomsData
+from netpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
+from netpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
+from netpack.train           import build_mse_loss, build_mae_loss, build_sae_loss
+from storer                  import Storer
+from collections             import defaultdict
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -99,6 +98,10 @@ CONVERTER = {
 
 @dataclass
 class GPUInfo:
+    """
+    It provides information about GPU utilization and GPU availability.
+
+    """
     gpus       : List = field(default_factory=list)
     idx_in_use : List = field(default_factory=list)
     notified   : int  = 0
@@ -218,8 +221,6 @@ class GPUInfo:
                 print("[Warning!] No empty devices even without G type jobs!")
                 self.notified += 1
         return idx
-
-## NNMeta
 
 @dataclass
 class NNClass:
@@ -673,7 +674,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             except FileNotFoundError: pass
 
         # split train validation testf
-        self.train_samples, self.valid_samples, self.test_samples = spk.train_test_split(
+        self.train_samples, self.valid_samples, self.test_samples = pack.train_test_split(
             data       = self.samples,
             num_train  = self._number_train_samples,
             num_val    = self._number_valid_samples,
@@ -701,7 +702,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         if os.path.exists(self.model_path + "/best_model"):
             print_function(f"{self.internal_name} Already trained network exists!")
             print_function(f"Loading [{self.device}]...")
-            self.model = spk.utils.load_model(self.model_path + "/best_model", map_location=map_location)
+            self.model = pack.utils.load_model(self.model_path + "/best_model", map_location=map_location)
             print_function(f"Model parameters: {self.model}")
 
         else:
@@ -709,7 +710,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             print_function(f"{self.internal_name} Building the model...")
             output_modules = []
 
-            representation = spk.SchNet(
+            representation = pack.SchNet(
                 n_atom_basis         = self.n_features,
                 n_filters            = self.n_filters,
                 n_interactions       = self.n_interactions,
@@ -720,7 +721,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 return_intermediate  = False,               # False -- default
                 max_z                = 100,                 # 100   -- default
                 charged_systems      = False,               # False -- default
-                cutoff_network       = spk.nn.cutoff.CosineCutoff,
+                cutoff_network       = pack.nn.cutoff.CosineCutoff,
                 )
 
             if "energy" in self.training_properties or "forces" in self.training_properties:
@@ -741,7 +742,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     means_energy  = None
                     stddevs_enegy = None
 
-                ENERGY_FORCE = spk.atomistic.Atomwise(
+                ENERGY_FORCE = pack.atomistic.Atomwise(
                     n_in             = representation.n_atom_basis,
                     n_out            = 1,                            # 1    -- default
                     aggregation_mode = "sum",                        # sum  -- default
@@ -757,12 +758,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
             if "dipole_moment" in self.training_properties or "dipole_moment_magnitude" in self.training_properties:
 
-                DIPOLE_MOMENT = spk.atomistic.DipoleMoment(
+                DIPOLE_MOMENT = pack.atomistic.DipoleMoment(
                     n_in              = representation.n_atom_basis,
                     n_out             = 1 if self.is_dipole_moment_magnitude else 3,
                     n_layers          = self.n_layers_dipole_moment,  # 2 -- default
                     n_neurons         = self.n_neurons_dipole_moment, # None -- default
-                    activation        = spk.nn.activations.shifted_softplus,
+                    activation        = pack.nn.activations.shifted_softplus,
                     property          = "dipole_moment_magnitude" if self.is_dipole_moment_magnitude else "dipole_moment",
                     contributions     = None,
                     predict_magnitude = True if self.is_dipole_moment_magnitude else False,
@@ -996,7 +997,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     trained_subset = True
                 else:
                     samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
-                    subsamples, idxs = spk.get_subset(
+                    subsamples, idxs = pack.get_subset(
                         data         = samples,
                         num_samples  = self.check_list_files[xyz_file]['num_points'], #self.visualize_points_from_nn,
                     )
@@ -1006,7 +1007,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     self.use_model_on_test(_subsamples_loader = subsamples_loader, need2plot=False)
 
                 print_function(f"[{network_name}] Loading the last best model")
-                best_model = spk.utils.load_model(model_path, map_location=self.device)
+                best_model = pack.utils.load_model(model_path, map_location=self.device)
 
                 print_function(f"Predicting on subset [#{len(idxs)}]...")
                 self.preds = preds = defaultdict(list)
@@ -1145,7 +1146,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
         which = "trained" if path2model is None else "[FOREIGN]"
         if path2model is None: best_model = self.model
-        else:                  best_model = spk.utils.load_model(self.model_path + "/best_model", map_location=self.device)
+        else:                  best_model = pack.utils.load_model(self.model_path + "/best_model", map_location=self.device)
 
         print_function(f"{self.internal_name} Using the {which} model on the test data...")
 
