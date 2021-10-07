@@ -5,10 +5,10 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name         = 'nnmeta',
-    version      = '1.5.5',
+    version      = '1.5.10',
     author       = 'Alexander D. Kazakov',
     author_email = 'alexander.d.kazakov@gmail.com',
-    description  = 'NNMeta based on Schnetpack [https://github.com/atomistic-machine-learning/schnetpack].',
+    description  = 'NNmeta based on Netpack',
     license      = 'MIT',
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -26,6 +26,7 @@ setuptools.setup(
       ],
     python_requires='>=3.7',
     install_requires=[
+        "netpack",
         "storer",
     ],
 )

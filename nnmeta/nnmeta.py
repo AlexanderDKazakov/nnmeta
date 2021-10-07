@@ -22,26 +22,26 @@
 ## SOFTWARE.
 ##*
 
-
 from dataclasses import dataclass, field
-from typing      import List, Any
+from typing      import List, Any, Callable
 from torch       import Tensor
 from ase         import Atoms
 from ase.io      import read
+from ase.units   import Bohr,kJ,Hartree,mol,kcal
 
-import numpy      as np
-import schnetpack as spk
+import numpy   as np
+import netpack as pack
 
 import torch
 import os, sys, shutil, re
-from schnetpack.atomistic.model import AtomisticModel
-from schnetpack                 import AtomsLoader
-from schnetpack                 import AtomsData
-from schnetpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
-from schnetpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
-from schnetpack.train           import build_mse_loss
-from storer                     import Storer
-from collections                import defaultdict
+from netpack.atomistic.model import AtomisticModel
+from netpack                 import AtomsLoader
+from netpack                 import AtomsData
+from netpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
+from netpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
+from netpack.train           import build_mse_loss, build_mae_loss, build_sae_loss
+from storer                  import Storer
+from collections             import defaultdict
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -53,8 +53,55 @@ else:    print_function = print
 from subprocess import Popen, PIPE
 import xml.etree.ElementTree as ET
 
+DM = {
+    0 : "dipole_moment_x",
+    1 : "dipole_moment_y",
+    2 : "dipole_moment_z",
+}
+
+AVAILABLE_ENERGY_UNITS = ["hartree", "kj/mol", "kcal/mol", "ev"]
+AVAILABLE_FORCE_UNITS  = ["bohr", "angstrom"]
+AVAILABLE_DM_UNITS     = ["debye"]
+
+
+CONVERTER = {
+    # ENERGY
+    # from
+    "hartree" : {
+        # to
+        "hartree":  1.,                  # assuming input energy as Hartree
+        "kcal/mol": Hartree * mol/kcal,  # ~ 627.5094
+        "kj/mol":   Hartree * mol/kJ,    # ~ 2625.4996
+        "ev":       Hartree,             # ~ 27.2114
+    },
+    # FORCE
+    # from
+    "hartree/bohr" : {
+        # to
+        "hartree/bohr":  1.,                  # assuming input force as Hartree/Bohr
+        "kcal/mol/bohr": Hartree * mol/kcal,  # ~ 627.5094
+        "kj/mol/bohr":   Hartree * mol/kJ,    # ~ 2625.4996
+        "ev/bohr":       Hartree,             # ~ 27.2114
+        # angstrom
+        "hartree/angstrom":  Bohr * 1.,                  # assuming input force as Hartree/Bohr
+        "kcal/mol/angstrom": Bohr * Hartree * mol/kcal,  # ~ 332.0637
+        "kj/mol/angstrom":   Bohr * Hartree * mol/kJ,    # ~ 1389.3545
+        "ev/angstrom":       Bohr * Hartree,             # ~ 14.3996
+    },
+    # DIPOLE_MOMENT
+    # from
+    "debye" : {
+        # to
+        "debye":  1.,                  # assuming input DM as Debye
+    },
+}
+
 @dataclass
 class GPUInfo:
+    """
+    It provides information about GPU utilization and GPU availability.
+
+    """
     gpus       : List = field(default_factory=list)
     idx_in_use : List = field(default_factory=list)
     notified   : int  = 0
@@ -175,20 +222,20 @@ class GPUInfo:
                 self.notified += 1
         return idx
 
-## NNMeta
-
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.5.5"
+    __version__                  : str            = "1.5.10"
     debug                        : bool           = False
     _should_train                : bool           = True
+    _force_gpu                   : bool           = False
+    _force_map                   : List[int]      = None
 
     internal_name                : str            = "[NNClass]"
     system_path                  : str            = "."
     plot_enabled                 : bool           = False
     meta                         : bool           = True
     storer                       : object         = None
-    device                       : str            = "cuda" if torch.cuda.is_available() else "cpu"
+    device                       : str            = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     network_name                 : str            = "unknower"
     info                         : dict           = field(default_factory=dict)
     gpu_info                     : GPUInfo        = GPUInfo()
@@ -197,11 +244,13 @@ class NNClass:
     training_properties          : tuple          = ("energy", "forces", "dipole_moment")  # properties used for training
     db_epochs                    : dict           = field(default_factory=dict)
     training_progress            : dict           = field(default_factory=dict)
+    loss_function_choice         : str            = "mse" # Available: ["mse", "mae", "sae", .?.]
+    loss_fun_builder             : Callable       = None
     #
     redo_split_file              : bool           = False
     foreign_plotted              : bool           = False
     loss_tradeoff                : tuple          = (0.2, 0.8, 0.5)
-    lr                           : float          = 1e-4
+    lr                           : np.float64     = 1e-4
     predict_each_epoch           : int            = 10
     validate_each_epoch          : int            = 10
 
@@ -216,11 +265,13 @@ class NNClass:
     n_layers_dipole_moment       : int            = 2
     n_neurons_energy_force       : int            = None
     n_neurons_dipole_moment      : int            = None
+    _n_output_dipole_moment      : int            = 3
+    is_dipole_moment_magnitude   : bool           = False
 
     #
     using_matplotlib             : bool           = False
     compare_with_foreign_model   : bool           = False
-    visualize_points_from_nn     : int            = 100
+    # visualize_points_from_nn     : int            = 100  # DEPRECATED // REMOVE IN NEXT VERSION
     visualize_points_from_data   : int            = 100
     #
     samples                      : List[Atoms]    = None
@@ -234,15 +285,17 @@ class NNClass:
     valid_samples                : np.array       = None
     test_samples                 : np.array       = None
 
-    number_training_examples_percent  : float     = 60.0
-    number_validation_examples_percent: float     = 20.0
-
-    units_dimensions = dict(
+    train_samples_percent        : np.float64     = 60.0
+    valid_samples_percent        : np.float64     = 20.0
+    _number_train_samples         :int             = 0
+    _number_valid_samples         :int             = 0
+    units = dict(
         ENERGY        = "Hartree",
         FORCE         = "Hartree/Bohr",
         DIPOLE_MOMENT = "Debye"
     )
-    check_list_files = {}
+
+    check_list_files              : dict          = field(default_factory=dict)
 
     def __post_init__(self):
         if self.system_path[-1] != "/": self.system_path+="/"
@@ -273,37 +326,41 @@ class NNClass:
             sys.exit(1)
 
         self.db_epochs = self.info[self.network_name]
-        if self.info[kf].get("_should_train") is not None:          self._should_train                      = self.info[kf].get("_should_train")
-        if self.info[kf].get("device")        is not None:          self.device                             = self.info[kf].get("device")
-        if self.info[kf].get("predict_each_epoch"):                 self.predict_each_epoch                 = self.info[kf].get("predict_each_epoch")
-        if self.info[kf].get("validate_each_epoch"):                self.validate_each_epoch                = self.info[kf].get("validate_each_epoch")
-        if self.info[kf].get("lr"):                                 self.lr                                 = self.info[kf].get("lr")
-        if self.info[kf].get("batch_size"):                         self.batch_size                         = self.info[kf].get("batch_size")
-        if self.info[kf].get("n_features"):                         self.n_features                         = self.info[kf].get("n_features")
-        if self.info[kf].get("n_filters"):                          self.n_filters                          = self.info[kf].get("n_filters")
-        if self.info[kf].get("n_interactions"):                     self.n_interactions                     = self.info[kf].get("n_interactions")
-        if self.info[kf].get("n_gaussians"):                        self.n_gaussians                        = self.info[kf].get("n_gaussians")
-        if self.info[kf].get("cutoff"):                             self.cutoff                             = self.info[kf].get("cutoff")
-        if self.info[kf].get("db_properties"):                      self.db_properties                      = self.info[kf].get("db_properties")
-        if self.info[kf].get("training_properties"):                self.training_properties                = self.info[kf].get("training_properties")
-        if self.info[kf].get("loss_tradeoff"):                      self.loss_tradeoff                      = self.info[kf].get("loss_tradeoff")
+        if self.info[kf].get("_should_train")              is not None: self._should_train               = self.info[kf].get("_should_train")
+        if self.info[kf].get("_force_gpu")                 is not None: self._force_gpu                  = self.info[kf].get("_force_gpu")
+        if self.info[kf].get("_force_map")                 is not None: self._force_map                  = self.info[kf].get("_force_map")
+        if self.info[kf].get("device")                     is not None: self.device                      = torch.device(self.info[kf].get("device"))
+        if self.info[kf].get("is_dipole_moment_magnitude") is not None: self.is_dipole_moment_magnitude  = self.info[kf].get("is_dipole_moment_magnitude")
+        if self.info[kf].get("predict_each_epoch"):                     self.predict_each_epoch          = self.info[kf].get("predict_each_epoch")
+        if self.info[kf].get("validate_each_epoch"):                    self.validate_each_epoch         = self.info[kf].get("validate_each_epoch")
+        if self.info[kf].get("lr"):                                     self.lr                          = self.info[kf].get("lr")
+        if self.info[kf].get("batch_size"):                             self.batch_size                  = self.info[kf].get("batch_size")
+        if self.info[kf].get("n_features"):                             self.n_features                  = self.info[kf].get("n_features")
+        if self.info[kf].get("n_filters"):                              self.n_filters                   = self.info[kf].get("n_filters")
+        if self.info[kf].get("n_interactions"):                         self.n_interactions              = self.info[kf].get("n_interactions")
+        if self.info[kf].get("n_gaussians"):                            self.n_gaussians                 = self.info[kf].get("n_gaussians")
+        if self.info[kf].get("cutoff"):                                 self.cutoff                      = self.info[kf].get("cutoff")
+        if self.info[kf].get("db_properties"):                          self.db_properties               = self.info[kf].get("db_properties")
+        if self.info[kf].get("training_properties"):                    self.training_properties         = self.info[kf].get("training_properties")
+        if self.info[kf].get("loss_tradeoff"):                          self.loss_tradeoff               = self.info[kf].get("loss_tradeoff")
 
-        if self.info[kf].get("n_layers_energy_force"):              self.n_layers_energy_force              = self.info[kf].get("n_layers_energy_force")
-        if self.info[kf].get("n_neurons_energy_force"):             self.n_neurons_energy_force             = self.info[kf].get("n_neurons_energy_force")
+        if self.info[kf].get("n_layers_energy_force"):                  self.n_layers_energy_force       = self.info[kf].get("n_layers_energy_force")
+        if self.info[kf].get("n_neurons_energy_force"):                 self.n_neurons_energy_force      = self.info[kf].get("n_neurons_energy_force")
 
-        if self.info[kf].get("n_layers_dipole_moment"):             self.n_layers_dipole_moment             = self.info[kf].get("n_layers_dipole_moment")
-        if self.info[kf].get("n_neurons_dipole_moment"):            self.n_neurons_dipole_moment            = self.info[kf].get("n_neurons_dipole_moment")
+        if self.info[kf].get("n_layers_dipole_moment"):                 self.n_layers_dipole_moment      = self.info[kf].get("n_layers_dipole_moment")
+        if self.info[kf].get("n_neurons_dipole_moment"):                self.n_neurons_dipole_moment     = self.info[kf].get("n_neurons_dipole_moment")
 
-        if self.info[kf].get("number_training_examples_percent"):   self.number_training_examples_percent   = self.info[kf].get("number_training_examples_percent")
-        if self.info[kf].get("number_validation_examples_percent"): self.number_validation_examples_percent = self.info[kf].get("number_validation_examples_percent")
+        if self.info[kf].get("train_samples_percent"):                  self.train_samples_percent       = self.info[kf].get("train_samples_percent")
+        if self.info[kf].get("valid_samples_percent"):                  self.valid_samples_percent       = self.info[kf].get("valid_samples_percent")
 
-        if self.info[kf].get("visualize_points_from_data"):         self.visualize_points_from_data         = self.info[kf].get("visualize_points_from_data")
-        if self.info[kf].get("visualize_points_from_nn"):           self.visualize_points_from_nn           = self.info[kf].get("visualize_points_from_nn")
+        if self.info[kf].get("visualize_points_from_data"):             self.visualize_points_from_data  = self.info[kf].get("visualize_points_from_data")
 
-        if self.info[kf].get("units_dimensions"):                   self.units_dimensions                   = self.info[kf].get("units_dimensions")
-        if self.info[kf].get("check_list_files"):                   self.check_list_files                   = self.info[kf].get("check_list_files")
+        if self.info[kf].get("check_list_files"):                       self.check_list_files            = self.info[kf].get("check_list_files")
+        if self.info[kf].get("loss_function_choice"):                   self.loss_function_choice        = self.info[kf].get("loss_function_choice")
+        if self.info[kf].get("units"):                                  self.units                       = self.info[kf].get("units")
 
         self.check_provided_parameters()
+        self._import_relevant_loss()
         print_function(f"{self.internal_name} [v.{self.__version__}] | System path: {self.system_path}")
         if self.debug: print_function(f"<<<Debug call>>>\n {str(self)}"); sys.exit(0)
 
@@ -320,50 +377,75 @@ class NNClass:
 
             pages_info = dict()
             if "energy" in self.training_properties:
-                pages_info["delta_energy"] = dict(xname="[sample number]" , yname=f"\\Delta Energy [{self.units_dimensions['ENERGY']}]",)
-                pages_info["xyz_file"]     = dict(xname="[sample number]" , yname=f"Energy [{self.units_dimensions['ENERGY']}]",)
-                pages_info["xyz_file_sub"] = dict(xname="[sample number]" , yname=f"Energy-(int)E[0], [{self.units_dimensions['ENERGY']}]",)
-                pages_info["diag_energy"]  = dict(xname=f"Energy [orig], [{self.units_dimensions['ENERGY']}]",
-                                                  yname=f"Energy [pred], [{self.units_dimensions['ENERGY']}]",)
+                pages_info["delta_energy"] = dict(xname="[sample number]" , yname=f"\\Delta Energy [{self.units['ENERGY']}]",)
+                pages_info["xyz_file"]     = dict(xname="[sample number]" , yname=f"Energy [{self.units['ENERGY']}]",)
+                pages_info["xyz_file_sub"] = dict(xname="[sample number]" , yname=f"Energy-(int)E[0], [{self.units['ENERGY']}]",)
+                pages_info["diag_energy"]  = dict(xname=f"Energy [orig], [{self.units['ENERGY']}]",
+                                                  yname=f"Energy [pred], [{self.units['ENERGY']}]",)
                 # framework
-                pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units_dimensions['ENERGY']}]",)
-                pages_info["forces_loss"]  = dict(xname="Time [s]", yname=f"Force  LOSS [{self.units_dimensions['FORCE']}]",)
+                pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units['ENERGY']}]",)
+                pages_info["forces_loss"]  = dict(xname="Time [s]", yname=f"Force  LOSS [{self.units['FORCE']}]",)
 
-            if "dipole_moment" in self.training_properties:
+            if "dipole_moment" in self.training_properties or "dipole_moment_magnitude" in self.training_properties:
                 # framework
-                pages_info["dipole_moment_loss"]    = dict(xname="[sample number]", yname=f"Dipole moment LOSS [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                pages_info["dipole_moment_loss"]    = dict(xname="[sample number]", yname=f"Dipole moment LOSS [{self.units['DIPOLE_MOMENT']}]",)
                 #
-                pages_info["dipole_moment_x"]       = dict(xname="[sample number]", yname=f"Dipole moment [x] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
-                pages_info["dipole_moment_y"]       = dict(xname="[sample number]", yname=f"Dipole moment [y] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
-                pages_info["dipole_moment_z"]       = dict(xname="[sample number]", yname=f"Dipole moment [z] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
-                #
-                pages_info["diag_dp_x"]             = dict(xname=f"Dipole moment [x] [orig] [{self.units_dimensions['DIPOLE_MOMENT']}]",
-                                                           yname=f"Dipole moment [x] [pred] [{self.units_dimensions['DIPOLE_MOMENT']}]")
-                pages_info["diag_dp_y"]             = dict(xname=f"Dipole moment [y] [orig] [{self.units_dimensions['DIPOLE_MOMENT']}]",
-                                                           yname=f"Dipole moment [y] [pred] [{self.units_dimensions['DIPOLE_MOMENT']}]")
-                pages_info["diag_dp_z"]             = dict(xname=f"Dipole moment [z] [orig] [{self.units_dimensions['DIPOLE_MOMENT']}]",
-                                                           yname=f"Dipole moment [z] [pred] [{self.units_dimensions['DIPOLE_MOMENT']}]")
+                if self.is_dipole_moment_magnitude:
+                    pages_info["dipole_moment_magnitude"]       = dict(xname="[sample number]", yname=f"Dipole moment [magnitude] [{self.units['DIPOLE_MOMENT']}]",)
+                    pages_info["diag_dp_magnitude"]             = dict(xname=f"Dipole moment [magnitude] [orig] [{self.units['DIPOLE_MOMENT']}]",
+                                                                       yname=f"Dipole moment [magnitude] [pred] [{self.units['DIPOLE_MOMENT']}]")
+                    pages_info["delta_dipole_moment_magnitude"] = dict(xname="[sample number]",
+                                                                       yname=f"\\Delta Dipole moment [magnitude] [{self.units['DIPOLE_MOMENT']}]",)
+                else:
+                    pages_info["dipole_moment_x"]       = dict(xname="[sample number]", yname=f"Dipole moment [x] [{self.units['DIPOLE_MOMENT']}]",)
+                    pages_info["dipole_moment_y"]       = dict(xname="[sample number]", yname=f"Dipole moment [y] [{self.units['DIPOLE_MOMENT']}]",)
+                    pages_info["dipole_moment_z"]       = dict(xname="[sample number]", yname=f"Dipole moment [z] [{self.units['DIPOLE_MOMENT']}]",)
+                    #
+                    pages_info["diag_dp_x"]             = dict(xname=f"Dipole moment [x] [orig] [{self.units['DIPOLE_MOMENT']}]",
+                                                               yname=f"Dipole moment [x] [pred] [{self.units['DIPOLE_MOMENT']}]")
+                    pages_info["diag_dp_y"]             = dict(xname=f"Dipole moment [y] [orig] [{self.units['DIPOLE_MOMENT']}]",
+                                                               yname=f"Dipole moment [y] [pred] [{self.units['DIPOLE_MOMENT']}]")
+                    pages_info["diag_dp_z"]             = dict(xname=f"Dipole moment [z] [orig] [{self.units['DIPOLE_MOMENT']}]",
+                                                               yname=f"Dipole moment [z] [pred] [{self.units['DIPOLE_MOMENT']}]")
 
-                pages_info["delta_dipole_moment_x"] = dict(xname="[sample number]",
-                                                           yname=f"\\Delta Dipole moment [x] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
-                pages_info["delta_dipole_moment_y"] = dict(xname="[sample number]",
-                                                           yname=f"\\Delta Dipole moment [y] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
-                pages_info["delta_dipole_moment_z"] = dict(xname="[sample number]",
-                                                           yname=f"\\Delta Dipole moment [z] [{self.units_dimensions['DIPOLE_MOMENT']}]",)
+                    pages_info["delta_dipole_moment_x"] = dict(xname="[sample number]",
+                                                               yname=f"\\Delta Dipole moment [x] [{self.units['DIPOLE_MOMENT']}]",)
+                    pages_info["delta_dipole_moment_y"] = dict(xname="[sample number]",
+                                                               yname=f"\\Delta Dipole moment [y] [{self.units['DIPOLE_MOMENT']}]",)
+                    pages_info["delta_dipole_moment_z"] = dict(xname="[sample number]",
+                                                               yname=f"\\Delta Dipole moment [z] [{self.units['DIPOLE_MOMENT']}]",)
 
-            self.plotter_progress = Plotter(title="Check Results", pages_info=pages_info)
-            self.plotter_log = Plotter(title="", engine="gnuplot")
+            self.plotter_progress = Plotter(title="Check Results", pages_info=pages_info, keyFontSize = 8)
+            self.plotter_log      = Plotter(title="", engine="gnuplot")
 
 
     def check_provided_parameters(self) -> None:
         ok = True; mess = ""
         # 1
-        if (self.number_training_examples_percent + self.number_validation_examples_percent) >= 100:
+        if (self.train_samples_percent + self.valid_samples_percent) >= 100:
             ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
-        # 2...
+        # 2
+        # units
+        if self.units["ENERGY"].lower() in AVAILABLE_ENERGY_UNITS:              ok1 = True;  mess1 = ""
+        else:                                                                   ok1 = False; mess1 = f"Not available energy units [{self.units['ENERGY']}];"
+        if self.units["FORCE"].split("/")[-1].lower() in AVAILABLE_FORCE_UNITS: ok2 = True;  mess2 = ""
+        else:                                                                   ok2 = False; mess2 = f"Not available force units [{self.units['FORCE']}];"
+        if self.units["DIPOLE_MOMENT"].lower() in AVAILABLE_DM_UNITS:           ok3 = True;  mess3 = ""
+        else:                                                                   ok3 = False; mess3 = f"Not available dipole moment units [{self.units['DIPOLE_MOMENT']}];"
+        ok   = ok1 and ok2 and ok3
+        mess = mess1 + mess2 + mess3
 
         if not ok: print_function(mess); sys.exit(1)
 
+    def _import_relevant_loss(self) -> None:
+        if   self.loss_function_choice == "mse": self.loss_fun_builder = build_mse_loss
+        elif self.loss_function_choice == "mae": self.loss_fun_builder = build_mae_loss
+        elif self.loss_function_choice == "sae": self.loss_fun_builder = build_sae_loss
+        else:
+            print(f"Waring! Loss function choice is not covered, MSE loss function will be in use!\n [Your choice is {self.loss_function_choice}]...")
+            self.loss_fun_builder = build_mse_loss
+
+# DEPRECATED // REMOVE IN NEXT VERSION
     @staticmethod
     def loss_function(batch: Any, result: Any) -> Tensor:
         # tradeoff
@@ -391,29 +473,34 @@ class NNClass:
                 db_list.append(db_fname)
         return db_list
 
+    def _get_db_name(self, xyz_file: str,  indexes: str) -> str:
+            return f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+
     def print_info(self) -> None:
         print_function(f"""
-# # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device} | GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
-        NUMBER TRAINING EXAMPLES  [%]:   {self.number_training_examples_percent}
-        NUMBER VALIDATION EXAMPLES[%]:   {self.number_validation_examples_percent}
-        LEARNING RATE                :   {self.lr}
-        N INTERACTION                :   {self.n_interactions}
-        LOSS TRADEOFF                :   {self.loss_tradeoff}
-        TRAINING PROPERTIES          :   {self.training_properties}
+# # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device.type} | GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
+        NUMBER TRAINING EXAMPLES  [%]/# :   {self.train_samples_percent}/{self._number_train_samples}
+        NUMBER VALIDATION EXAMPLES[%]/# :   {self.valid_samples_percent}/{self._number_valid_samples}
+        LEARNING RATE                   :   {self.lr}
+        N INTERACTION                   :   {self.n_interactions}
+        LOSS TRADEOFF                   :   {self.loss_tradeoff}
+        LOSS FUNCTION CHOICE            :   {self.loss_function_choice}
+        TRAINING PROPERTIES             :   {self.training_properties}
 
-        ENERGY UNITS                 :   [{self.units_dimensions["ENERGY"]}]
-        FORCE UNITS                  :   [{self.units_dimensions["FORCE"]}]
-        DIPOLE MOMENT UNITS          :   [{self.units_dimensions["DIPOLE_MOMENT"]}]
+        ENERGY UNITS                    :   [{self.units["ENERGY"]}]
+        FORCE UNITS                     :   [{self.units["FORCE"]}]
+        DIPOLE MOMENT UNITS             :   [{self.units["DIPOLE_MOMENT"]}]
+            DIPOLE_MOMENT MAGNITUDE     :   [{self.is_dipole_moment_magnitude}]
 
         DB INFO:
-            PROPERTIES               :   {self.db_properties}
-            [INDEXES : EPOCHS]       :   {self.db_epochs.items()}
+            PROPERTIES                  :   {self.db_properties}
+            [INDEXES : EPOCHS]          :   {self.db_epochs.items()}
 
         PATHS:
-            XYZ                      :   {self.xyz_path}
-            DB                       :   {self.db_path}
-            MODEL [GENERAL]          :   {self.general_models_path}
-            SPLITS                   :   {self.split_path}
+            XYZ                         :   {self.xyz_path}
+            DB                          :   {self.db_path}
+            MODEL [GENERAL]             :   {self.general_models_path}
+            SPLITS                      :   {self.split_path}
 
         """)
         self.storer.show()
@@ -446,7 +533,11 @@ class NNClass:
         Plotting the training progress by the framework.
 
         """
-        energy_loss, forces_loss, dipole_moment_loss = [None], [None], [None]
+
+        energy_loss, forces_loss, = torch.Tensor(np.array([0.])), torch.tensor(np.array([[0., 0., 0.], [0., 0., 0.]]))
+        if self.is_dipole_moment_magnitude:  dipole_moment_loss = torch.Tensor(np.array([0.]))
+        else:                                dipole_moment_loss = torch.tensor(np.array([[0., 0., 0.], [0., 0., 0.]]))
+
         with open(os.path.join(self.model_path, 'log.csv')) as flog: head = [next(flog) for line in range(1)]
         titles = head[0].strip().lower().split(",")
         # Load logged results
@@ -463,14 +554,16 @@ class NNClass:
         if 'energy'        in self.training_properties: energy_loss        = self.training_progress['energy']
         if 'forces'        in self.training_properties: forces_loss        = self.training_progress['forces']
         if 'dipole_moment' in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment']
+        if "dipole_moment_magnitude" in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment_magnitude']
+
 
         # Get final validation errors
         print_function(f"""
 
 Validation LOSS | epochs {self.storer.get(self.name4storer)}:
-          <energy> [{self.units_dimensions['ENERGY']}]: {str(energy_loss[-1])[:10]:>15}
-          <forces> [{self.units_dimensions['FORCE']}]: {str(forces_loss[-1])[:10]}
-          <dipole moment> [{self.units_dimensions['DIPOLE_MOMENT']}]: {str(dipole_moment_loss[-1])[:10]}
+          <energy> [{self.units['ENERGY']}]: {str(energy_loss[-1]):>25}
+          <forces> [{self.units['FORCE']}]: {str(forces_loss[-1]):>15}
+          <dipole moment> [{self.units['DIPOLE_MOMENT']}]: {str(dipole_moment_loss[-1]):>15}
 
         """)
 
@@ -479,7 +572,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             if not self.using_matplotlib:
                 if 'energy'        in self.training_properties: self.plotter_progress.plot(x=time, y=energy_loss,        key_name="", page="energy_loss")
                 if 'forces'        in self.training_properties: self.plotter_progress.plot(x=time, y=forces_loss,        key_name="", page="forces_loss")
-                if 'dipole_moment' in self.training_properties: self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
+                if 'dipole_moment' in self.training_properties or 'dipole_moment_magnitude' in self.training_properties:
+                    self.plotter_progress.plot(x=time, y=dipole_moment_loss, key_name="", page="dipole_moment_loss")
             else:
                 # Matplotlib instructions
                 plt.figure(figsize=(14,5))
@@ -488,14 +582,14 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 plt.subplot(1,2,1)
                 plt.plot(time, energy_loss)
                 plt.title("Energy")
-                plt.ylabel("Energy LOSS [{self.units_dimensions['ENERGY']}]")
+                plt.ylabel("Energy LOSS [{self.units['ENERGY']}]")
                 plt.xlabel("Time [s]")
 
                 # Plot forces
                 plt.subplot(1,2,2)
                 plt.plot(time, forces_loss)
                 plt.title("Forces")
-                plt.ylabel("Force LOSS [{self.units_dimensions['FORCE']}]")
+                plt.ylabel("Force LOSS [{self.units['FORCE']}]")
                 plt.xlabel("Time [s]")
                 plt.show()
 
@@ -509,12 +603,14 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 print_function(f"     {db_fname} removed.")
 
         print_function(f"{self.internal_name} Checking databases...")
-        db_path_fname = os.path.join(self.db_path, xyz_file + "_"+ str(index) + ".db")
-        if os.path.exists(db_path_fname): print_function(f" ==> {xyz_file + '_' + str(index) + '.db'} [OK]")
+        db_fname      = self._get_db_name(xyz_file=xyz_file, indexes=index)
+        db_path_fname = os.path.join(self.db_path, db_fname)
+
+        if os.path.exists(db_path_fname): print_function(f" ==> {db_fname} [OK]")
         else:
             # no databases is found
             print_function(f"{self.internal_name} Preparing databases...")
-            print_function(f"Creating db with indexes: {index}")
+            print_function(f"Creating {db_path_fname} with indexes: {index}")
             property_list = []
             samples = read(self.xyz_path + xyz_file, index=index, format="extxyz")
             for sample in tqdm(samples, "Preparing database..."):
@@ -525,15 +621,24 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 _ = dict()
                 if 'energy' in self.db_properties:
                     try:
-                        energy = np.array([sample.info['energy']], dtype=np.float32); _['energy'] = energy
+                        # assume energy comes in [Hartree]
+                        energy = np.array([sample.info['energy']], dtype=np.float64); _['energy'] = CONVERTER["hartree"][self.units['ENERGY'].lower()] * energy
                     except Exception as e: print_function(f"[Warning]: {e}")
                 if 'forces' in self.db_properties:
                     try:
-                        forces = np.array(sample.get_forces(),   dtype=np.float32); _['forces'] = forces
+                        # assume force comes in [Hartree/Borh]
+                        forces = np.array(sample.get_forces(),   dtype=np.float64); _['forces'] = CONVERTER["hartree/bohr"][self.units['FORCE'].lower()] * forces
                     except Exception as e: print_function(f"[Warning]: {e}")
                 if 'dipole_moment' in self.db_properties:
                     try:
-                        dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float32); _['dipole_moment'] = dipole_moment
+                        # assume dipole moment comes in [Debye]
+                        dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float64)
+                        _['dipole_moment'] = CONVERTER["debye"][self.units["DIPOLE_MOMENT"].lower()] * dipole_moment
+                    except Exception as e: print_function(f"[Warning]: {e}")
+                if 'dipole_moment_magnitude' in self.db_properties:
+                    try:
+                        dipole_moment = np.array(sample.get_dipole_moment(), dtype=np.float64)
+                        _['dipole_moment_magnitude'] = np.array([np.linalg.norm(dipole_moment)], dtype=np.float64)
                     except Exception as e: print_function(f"[Warning]: {e}")
                 property_list.append(_)
 
@@ -556,11 +661,11 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         print_function(f"->>> 1 sample[{atoms.symbols}]")
         print('->>> [DB] Properties:\n', *[' -- {:s}\n'.format(key) for key in props.keys()])
 
-        number_training_examples   = int(len(self.samples) * (self.number_training_examples_percent   / 100))
-        number_validation_examples = int(len(self.samples) * (self.number_validation_examples_percent / 100))
+        self._number_train_samples:int = int(len(self.samples) * (self.train_samples_percent / 100))
+        self._number_valid_samples:int = int(len(self.samples) * (self.valid_samples_percent / 100))
 
         # creating path_file
-        self.split_path_file = os.path.join(self.split_path, f"{db_name}_split_Ntrain{number_training_examples}_Nvalid{number_validation_examples}_{self.network_name}.npz")
+        self.split_path_file = os.path.join(self.split_path, f"{db_name}_split_Ntrain{self._number_train_samples}_Nvalid{self._number_valid_samples}_{self.network_name}.npz")
 
         # removing if redo
         if self.redo_split_file:
@@ -569,10 +674,10 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             except FileNotFoundError: pass
 
         # split train validation testf
-        self.train_samples, self.valid_samples, self.test_samples = spk.train_test_split(
+        self.train_samples, self.valid_samples, self.test_samples = pack.train_test_split(
             data       = self.samples,
-            num_train  = number_training_examples,
-            num_val    = number_validation_examples,
+            num_train  = self._number_train_samples,
+            num_val    = self._number_valid_samples,
             split_file = self.split_path_file,  # WARNING! if the file exists it will be loaded.
         )
 
@@ -586,10 +691,18 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
     def build_model(self) -> None:
         print_function(f"{self.internal_name} Checking the model...")
+        map_location = self.device
+        if len(self.gpu_info.get_gpu_in_use()) == 0: self.device = map_location =  torch.device("cpu")
+        if self._force_gpu:
+            self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            if self.device.type == "cpu": print("[WARNING] Requested force GPU calculation, but the device is not available! Returning to cpu calculation mode..."); map_location = torch.device("cpu")
+            if self._force_map is None: print("[WARNING] All available devices will be in use.");   map_location=torch.device("cuda")
+            else:                       print(f"Next devices will be in use: [{self._force_map}]"); self.device = map_location=torch.device(f"cuda:{self._force_map[0]}");
+
         if os.path.exists(self.model_path + "/best_model"):
             print_function(f"{self.internal_name} Already trained network exists!")
-            print_function(f"Loading...")
-            self.model = spk.utils.load_model(self.model_path + "/best_model", map_location=self.device)
+            print_function(f"Loading [{self.device}]...")
+            self.model = pack.utils.load_model(self.model_path + "/best_model", map_location=map_location)
             print_function(f"Model parameters: {self.model}")
 
         else:
@@ -597,7 +710,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             print_function(f"{self.internal_name} Building the model...")
             output_modules = []
 
-            representation = spk.SchNet(
+            representation = pack.SchNet(
                 n_atom_basis         = self.n_features,
                 n_filters            = self.n_filters,
                 n_interactions       = self.n_interactions,
@@ -608,7 +721,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 return_intermediate  = False,               # False -- default
                 max_z                = 100,                 # 100   -- default
                 charged_systems      = False,               # False -- default
-                cutoff_network       = spk.nn.cutoff.CosineCutoff,
+                cutoff_network       = pack.nn.cutoff.CosineCutoff,
                 )
 
             if "energy" in self.training_properties or "forces" in self.training_properties:
@@ -619,8 +732,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                                                                   divide_by_atoms = per_atom,
                                                                   single_atom_ref = None)
                     ## [0] !?!
-                    print_function(f"Mean atomization energy      / atom: {means['energy']} [{self.units_dimensions['ENERGY']}]")
-                    print_function(f"Std. dev. atomization energy / atom: {stddevs['energy']} [{self.units_dimensions['ENERGY']}]")
+                    print_function(f"Mean atomization energy      / atom: {means['energy']} [{self.units['ENERGY']}]")
+                    print_function(f"Std. dev. atomization energy / atom: {stddevs['energy']} [{self.units['ENERGY']}]")
                     means_energy  = means  ["energy"]
                     stddevs_enegy = stddevs["energy"]
                 except:
@@ -629,7 +742,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     means_energy  = None
                     stddevs_enegy = None
 
-                ENERGY_FORCE = spk.atomistic.Atomwise(
+                ENERGY_FORCE = pack.atomistic.Atomwise(
                     n_in             = representation.n_atom_basis,
                     n_out            = 1,                            # 1    -- default
                     aggregation_mode = "sum",                        # sum  -- default
@@ -643,16 +756,17 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 )
                 output_modules.append(ENERGY_FORCE)
 
-            if "dipole_moment" in self.training_properties:
+            if "dipole_moment" in self.training_properties or "dipole_moment_magnitude" in self.training_properties:
 
-                DIPOLE_MOMENT = spk.atomistic.DipoleMoment(
+                DIPOLE_MOMENT = pack.atomistic.DipoleMoment(
                     n_in              = representation.n_atom_basis,
+                    n_out             = 1 if self.is_dipole_moment_magnitude else 3,
                     n_layers          = self.n_layers_dipole_moment,  # 2 -- default
                     n_neurons         = self.n_neurons_dipole_moment, # None -- default
-                    activation        = spk.nn.activations.shifted_softplus,
-                    property          = "dipole_moment",
+                    activation        = pack.nn.activations.shifted_softplus,
+                    property          = "dipole_moment_magnitude" if self.is_dipole_moment_magnitude else "dipole_moment",
                     contributions     = None,
-                    predict_magnitude = False,
+                    predict_magnitude = True if self.is_dipole_moment_magnitude else False,
                     mean              = None,
                     stddev            = None,
                 )
@@ -663,11 +777,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             self.model = AtomisticModel(representation, output_modules)
             print_function(f"Model parameters: {self.model}")
 
-            if self.device == "cuda" and len(self.gpu_info.get_gpu_in_use()) > 1:
-                idx = self.gpu_info.get_gpu_in_use()
-                self.model = torch.nn.DataParallel(self.model)
-            print_function(f"{self.internal_name} [model building] done.")
-
+        if "cuda" in self.device.type:
+            if len(self.gpu_info.get_gpu_in_use()) > 1: self.model = torch.nn.DataParallel(self.model, device_ids=self.gpu_info.get_gpu_in_use())
+            elif self._force_gpu:
+                if self._force_map is None: self.model = torch.nn.DataParallel(self.model)
+                else:                       self.model = torch.nn.DataParallel(self.model, device_ids=self._force_map, output_device=self._force_map[0])
+        print_function(f"{self.internal_name} [model building] done.")
 
     def build_trainer(self) -> None:
 
@@ -678,16 +793,16 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
         hooks   = [
             CSVHook(log_path=self.model_path, metrics=metrics),
-            ReduceLROnPlateauHook(optimizer, patience=5, factor=0.8, min_lr=1e-6, stop_after_min=True)
+            ReduceLROnPlateauHook(optimizer, patience=15, factor=0.8, min_lr=1e-8, stop_after_min=True)
         ]
 
         # trainer
-        loss = build_mse_loss(self.training_properties, loss_tradeoff=self.loss_tradeoff)
+        loss_fun = self.loss_fun_builder(self.training_properties, loss_tradeoff=self.loss_tradeoff)
         self.trainer = Trainer(
             model_path        = self.model_path,
             model             = self.model,
             hooks             = hooks,
-            loss_fn           = loss,
+            loss_fn           = loss_fun,
             optimizer         = optimizer,
             train_loader      = self.train_loader,
             validation_loader = self.valid_loader,
@@ -695,8 +810,10 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
     def _train(self, epochs:int = None, indexes:str = None, xyz_file:str = None) -> None:
         print_function(f"{self.internal_name} Training...")
+        if self.device.type == "cpu":  mess = f"{self.device}"
+        if self.device.type == "cuda": mess = f"{self.device}: {self.gpu_info.get_gpu_in_use()}"
 
-        for epoch in tqdm(range(epochs), "Training", file=sys.stdout):
+        for epoch in tqdm(range(epochs), f"Training [{mess}]", file=sys.stdout):
             epochs_done = self.storer.get(self.name4storer)
 
             if epoch <= epochs_done: continue
@@ -717,7 +834,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     if not showed: self.gpu_info.notify(True); showed=True
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
                     self.predict(indexes=indexes, xyz_file=xyz_file)
-                    self.use_model_on_test(db_name=indexes)
+                    self.use_model_on_test(db_name=self._get_db_name(xyz_file=xyz_file, indexes=indexes))
 
         print_function(f"{self.internal_name} [model training] done.")
 
@@ -732,18 +849,21 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             for indexes, epochs in self.db_epochs[xyz_file].items():
                 print_function(f"Indexes: {indexes}")
                 self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
-                self.prepare_train_valid_test_samples(db_name = xyz_file+"_"+indexes+".db")
+                db_name = self._get_db_name(xyz_file=xyz_file, indexes=indexes)
+                self.prepare_train_valid_test_samples(db_name = db_name)
+
                 if self.plot_enabled: self.visualize_interest_region(indexes=indexes, samples4showing=self.visualize_points_from_data, source_of_points=self.train_samples)
 
                 # creating model instance: creating representation, output_modules for it
                 self.build_model()
+                self.print_info()
 
                 # initial preparations
                 if self._should_train: self.build_trainer()
                 #
-                self.name4storer = self.network_name +"_"+xyz_file+"_"+indexes+".nn"
+                self.name4storer = f"{self.network_name}_{db_name}.nn"
                 if not self.storer.get(self.name4storer): self.storer.put(what=0, name=self.name4storer)
-                print_function(f"--> [Storer]  epochs done: {self.storer.show(get_string=True)}")
+                print_function(f"--> [Storer]  epochs done: {self.storer.get(self.name4storer)}")
                 if self._should_train: print_function(f"--> [Trainer] epochs done: {self.trainer.epoch}")
 
                 #
@@ -752,16 +872,16 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.gpu_info.notify(True)
                 self.validate()
                 self.predict(indexes=indexes, xyz_file=xyz_file)
-                self.use_model_on_test(db_name=indexes)
+                self.use_model_on_test(db_name=db_name)
 
     def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
         print_function(f"{self.internal_name} Visualizing regions of interest...")
         # visualization whole range of points
         if xyz_file:
             self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
-            source_of_points = AtomsData(self.db_path + xyz_file+"_"+indexes+".db", load_only=self.training_properties)
+            #db_name = f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+            source_of_points = AtomsData(self.db_path + self._get_db_name(xyz_file=xyz_file, indexes=indexes), load_only=self.training_properties)
         # end
-        current_energy = []
         num_samples = len(source_of_points)
 
         if samples4showing > num_samples:
@@ -776,20 +896,44 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         # choose number of points from the source_of_points of region of interest
         self.idx4vis = idx_samples = [int(i) for i in np.linspace(0, num_samples-1, samples4showing)]
 
-        for idx in idx_samples:
-            _, props = source_of_points.get_properties(idx)
-            current_energy.append(props["energy"][0])
-        y = np.array(current_energy)
-        x = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, samples4showing)]
-        assert(len(y) == len(x), "Strange it x-y lengths are different")
-        if not self.using_matplotlib:
-            if 'energy' in self.training_properties:
+
+        # for each training_prop
+        for training_prop in self.training_properties:
+            # not necessary
+            if training_prop == "forces": continue
+            print(f"Training prop: {training_prop}")
+            samples2show = []
+
+            for idx in idx_samples:
+                _, props = source_of_points.get_properties(idx)
+                samples2show.append(np.array(props[training_prop])) #
+
+            y = np.array(samples2show)
+            x = [int(i) for i in np.linspace(start_region_of_interest, end_region_of_interest, samples4showing)]
+            assert(len(y) == len(x), "Strange it x-y lengths are different")
+            if not self.using_matplotlib:
                 key_name = "data: train/showed:["+str(num_samples)+"/"+str(samples4showing)+"] total:" + str(len(self.samples))
-                self.plotter_progress.plot(x=x, y=y,        key_name=key_name, page="xyz_file")
-                self.plotter_progress.plot(x=x, y=(y-y[0]), key_name=key_name, page="xyz_file_sub")
+
+                # dipole moments
+                if "dipole" in training_prop:
+                    # dipole_moment_x, dipole_moment_y, dipole_moment_z
+                    if y.shape[1] > 1:
+                        for dim in range(y.shape[1]):
+                            try: page = DM[dim]
+                            except ValueError:
+                                print(f"DM does not know the page for dim: {dim}. Aborting.")
+                                sys.exit(1)
+                            self.plotter_progress.plot(x=x, y=y[:,dim], key_name=key_name, page=page)
+                    else:
+                        ### dipole_moment_magnitude
+                        self.plotter_progress.plot(x=x, y=y[:,0], key_name=key_name, page="dipole_moment_magnitude")
+                else:
+                    # energy
+                    self.plotter_progress.plot(x=x, y=y[:,0],             key_name=key_name, page="xyz_file")
+                    self.plotter_progress.plot(x=x, y=(y[:,0]-y[:,0][0]), key_name=key_name, page="xyz_file_sub")
 
 
-    def predict(self, indexes:str  = None, xyz_file:str = None, path2foreign_model:str = None) -> None:
+    def predict(self, indexes:str  = None, xyz_file:str = None, path2foreign_model:str = None, need2plot:bool = True) -> None:
         """
         Prediction method.
 
@@ -807,23 +951,27 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             def compute_and_account(best_model, batch, idx):
                 ## move batch to GPU, if necessary
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                pred = best_model(batch)
+                pred  = best_model(batch)
+
                 if "energy"        in self.training_properties:
                     preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
                     preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
                 if "dipole_moment" in self.training_properties:
                     preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
-                    preds["pred_dipole_moment"].append((idx, pred["dipole_moment"].detach().cpu().numpy()))
+                    preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+                if "dipole_moment_magnitude" in self.training_properties:
+                    preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
+                    preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
 
             if path2foreign_model is not None:
                 if not self.foreign_plotted: self.foreign_plotted = True
-                network_name = key_prefix = "foreign_model"
+                network_name = key_prefix = "foreign model"
                 model_path   = os.path.join(path2foreign_model, 'best_model')
                 #fname_name   = "before_energy_predicted_"+str(indexes)+".dat"
                 epochs_done  = "[UNKNOWN]"
             else:
                 network_name = key_prefix = str(self.network_name)
-                model_path   = os.path.join(self.model_path, 'best_model') #self.model_path
+                model_path   = os.path.join(self.model_path, 'best_model')
                 epochs_done  = self.storer.get(self.name4storer)
                 #fname_name   = "before_energy_predicted_"+str(indexes)+"_epochs"+str(epochs_done)+"_each"+str(self.visualize_each_point_from_nn)+"sample.dat"
 
@@ -839,7 +987,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 #
                 print_function(f"Reading {xyz_file}...")
                 self.prepare_databases(redo=False, index=":", xyz_file=xyz_file)
-                db_path_fname = os.path.join(self.db_path, xyz_file + "_:.db")
+                #db_name = f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+                db_path_fname = os.path.join(self.db_path, self._get_db_name(xyz_file=xyz_file, indexes=indexes))
                 print_function(f"Loading... | {db_path_fname}")
                 #
                 if xyz_file in self.db_epochs.keys():
@@ -848,41 +997,42 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     trained_subset = True
                 else:
                     samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
-                    subsamples, idxs = spk.get_subset(
+                    subsamples, idxs = pack.get_subset(
                         data         = samples,
-                        num_samples  = self.visualize_points_from_nn,
+                        num_samples  = self.check_list_files[xyz_file]['num_points'], #self.visualize_points_from_nn,
                     )
                     subsamples_loader = AtomsLoader(subsamples, batch_size=1)
                     trained_subset = False
+                    # use model on test
+                    self.use_model_on_test(_subsamples_loader = subsamples_loader, need2plot=False)
 
                 print_function(f"[{network_name}] Loading the last best model")
-                best_model = spk.utils.load_model(model_path, map_location=self.device)
+                best_model = pack.utils.load_model(model_path, map_location=self.device)
 
                 print_function(f"Predicting on subset [#{len(idxs)}]...")
                 self.preds = preds = defaultdict(list)
 
-                if len(subsamples_loader) == self.visualize_points_from_nn:
+                if not trained_subset: #len(subsamples_loader) == self.visualize_points_from_nn:
                     for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")): compute_and_account(best_model, batch, idxs[idx])
                 else:
                     for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")):
                         if idx in idxs: compute_and_account(best_model, batch, idx)
 
                 ## Plotting
-
-                if not self.using_matplotlib and self.plot_enabled:
-                    try: sysname = xyz_file.split("_")[1]
+                if (self.plot_enabled and not self.using_matplotlib) and need2plot:
+                    try: sysname = xyz_file.replace("_", " ")
                     except:
                         if not trained_subset: sysname = "unnamed"
                         else: sysname = "data"
 
                     if 'energy' in self.training_properties:
-                        pred_energy        = np.array(preds["pred_energy"], dtype=float)
+                        pred_energy        = np.array(preds["pred_energy"], dtype=np.float64)
                         sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
-                        orig_energy        = np.array(preds["orig_energy"], dtype=float)
+                        orig_energy        = np.array(preds["orig_energy"], dtype=np.float64)
                         sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
 
-                        if trained_subset: key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
-                        else:              key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        if trained_subset: key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        else:              key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
                         self.plotter_progress.plot(page="xyz_file",     key_name = key_name,
                                                    x=sorted_pred_energy[:,0], y=sorted_pred_energy[:,1],  animation=True)
                         self.plotter_progress.plot(page="xyz_file_sub", key_name = key_name,
@@ -890,16 +1040,41 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         self.plotter_progress.plot(page="delta_energy", key_name = key_name,
                                                    x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
 
+                        self.CHECK1 = sorted_orig_energy
+                        self.CHECK2 = sorted_pred_energy
                         self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
                                                    x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
 
+                    if 'dipole_moment_magnitude' in self.training_properties:
+                        pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=np.float64)
+                        sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment[:,0].argsort()]
+                        orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=np.float64)
+                        sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment[:,0].argsort()]
+
+                        if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
+                        else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
+
+                        # original
+                        self.plotter_progress.plot(page="dipole_moment_magnitude", key_name=key_name,
+                                                   x=sorted_orig_dipole_moment[:,0],
+                                                   y=sorted_orig_dipole_moment[:,1])
+
+                        self.plotter_progress.plot(page="delta_dipole_moment_magnitude", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment[:,0],
+                                                   y=(sorted_pred_dipole_moment[:,1]-sorted_orig_dipole_moment[:,1]))
+
+                        self.plotter_progress.plot(page="diag_dp_magnitude", key_name = key_name, plotLine=False,
+                                                   x=sorted_orig_dipole_moment[:,1],
+                                                   y=sorted_pred_dipole_moment[:,1])
+
                     if 'dipole_moment' in self.training_properties:
+                        # not a magnitude --> [x, y ,z]
                         pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
                         sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
                         orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
                         sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
 
-                        #
+                        # original --> [x,y,z]
                         if trained_subset: key_name = f"{sysname} data: train/showed:["+str(len(self.train_samples))+"/"+str(len(idxs))+"] total:" + str(len(self.samples))
                         else:              key_name = f"{sysname} data: train/showed:[0/"+str(len(idxs))+"] total:" + str(len(samples))
                         self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name,
@@ -911,21 +1086,30 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
                         #
                         #key_name = f"{key_prefix} {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_dipole_moment))}"
-                        if trained_subset: key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
-                        else:              key_name = f"{key_prefix} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
+                        if trained_subset: key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(sorted_orig_dipole_moment['idx']))}"
+                        else:              key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(sorted_orig_dipole_moment['idx']))}"
                         self.plotter_progress.plot(page="dipole_moment_x", key_name=key_name,
-                                                   x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
                         self.plotter_progress.plot(page="dipole_moment_y", key_name=key_name,
-                                                   x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
                         self.plotter_progress.plot(page="dipole_moment_z", key_name=key_name,
-                                                   x=sorted_pred_dipole_moment["idx"], y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
 
-                        # delta
-                        self.plotter_progress.plot(page="delta_dipole_moment_x", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,0])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,0])) )
-                        self.plotter_progress.plot(page="delta_dipole_moment_y", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,1])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,1])) )
-                        self.plotter_progress.plot(page="delta_dipole_moment_z", key_name=key_name, x=sorted_pred_dipole_moment["idx"], y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,2])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,2])) )
+                        # delta  --> [x,y,z]
+                        self.plotter_progress.plot(page="delta_dipole_moment_x", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,0])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,0])) )
+                        self.plotter_progress.plot(page="delta_dipole_moment_y", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,1])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,1])) )
+                        self.plotter_progress.plot(page="delta_dipole_moment_z", key_name=key_name,
+                                                   x=sorted_pred_dipole_moment["idx"],
+                                                   y=(np.concatenate(sorted_pred_dipole_moment["xyz"][...,2])-np.concatenate(sorted_orig_dipole_moment["xyz"][...,2])) )
 
-                        # diag
+                        # diag --> [x,y,z]
                         self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
                                                    x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
                                                    y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
@@ -937,115 +1121,155 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                                                    y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
 
 
-    def use_model_on_test(self, db_name:str = None, path2model:str = None,) -> None:
-        # NOTE: REFACTORING IS REQUIRED
+    def use_model_on_test(self, db_name:str = None, path2model:str = None, _subsamples_loader:AtomsLoader = None, need2plot:bool = True) -> None:
         """
-
-        The function provides ability to use model [trained/foreign] on the test data.
+        The function provides ability to use model [trained/foreign] on the test data and plot results (if necessary (need2plot flag))
 
         """
+
+        def compute_and_account(best_model, batch, idx):
+            ## move batch to GPU, if necessary
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            pred = best_model(batch)
+            if "energy"        in self.training_properties:
+                preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
+                preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
+                # forces
+                preds["orig_forces"].append((idx, batch["forces"].detach().cpu().numpy() ))
+                preds["pred_forces"].append((idx, pred["forces"].detach().cpu().numpy()) )
+            if "dipole_moment" in self.training_properties:
+                preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
+                preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+            if "dipole_moment_magnitude" in self.training_properties:
+                preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
+                preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
 
         which = "trained" if path2model is None else "[FOREIGN]"
-        if path2model is None:  best_model = self.model
-        else:                   best_model = spk.utils.load_model(self.model_path + "/best_model", map_location=self.device)
+        if path2model is None: best_model = self.model
+        else:                  best_model = pack.utils.load_model(self.model_path + "/best_model", map_location=self.device)
 
         print_function(f"{self.internal_name} Using the {which} model on the test data...")
 
-        energy_error, forces_error, dipole_moment_error  = 0.0, torch.Tensor([.0, .0, .0]), torch.Tensor([.0, .0, .0])
+        energy_error, forces_error, = torch.Tensor(np.array([0.])), torch.tensor(np.array([0., 0., 0.]))
+        if self.is_dipole_moment_magnitude: dipole_moment_error = torch.Tensor(np.array([0.]))
+        else:                               dipole_moment_error = torch.tensor(np.array([0., 0., 0.]))
 
         if self.test_loader is None: self.prepare_train_valid_test_samples(db_name=db_name)
 
-        if "energy"        in self.training_properties: batch_name = "energy"
-        if "dipole_moment" in self.training_properties: batch_name = "dipole_moment"
-
-        samples_to_account = 0
-        subsamples_loader  = AtomsLoader(self.test_samples, batch_size=1)
+        if _subsamples_loader is not None: subsamples_loader = _subsamples_loader
+        else:                              subsamples_loader = AtomsLoader(self.test_samples, batch_size=1)
 
         self.test_preds = preds = defaultdict(list)
 
-        idx = 0
-        for batch in tqdm(subsamples_loader, f"{self.network_name} on test dataset [{self.device}]"):
+        for idx, batch in enumerate(tqdm(subsamples_loader, f"{self.network_name} on test dataset [{self.device}]")): compute_and_account(best_model, batch, idx)
 
-            samples_to_account += len(batch[batch_name])
-            # move batch to GPU, if necessary
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+        # need to calculate loss
+        if 'energy' in self.training_properties:
+            pred_energy = np.array(preds["pred_energy"], dtype=[('idx','i8'),('val', 'f8')])
+            orig_energy = np.array(preds["orig_energy"], dtype=[('idx','i8'),('val', 'f8')])
 
-            # apply model
-            pred = best_model(batch)
+            samples_to_account = len(orig_energy)
+            energy_error = np.sum( np.abs(pred_energy['val'] - orig_energy['val']) ) / samples_to_account
 
-            if "energy" in self.training_properties:
-                # calculate absolute error of energies
-                preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
-                preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
-                tmp_energy    = torch.sum(torch.abs(pred["energy"] - batch["energy"]))
-                tmp_energy    = tmp_energy.detach().cpu().numpy() # detach from graph & convert to numpy
-                energy_error += tmp_energy
+            # and force
+            # --> structure:
+            #                 [idx, array(X,...,X)]
+            #                            ...
+            #                 [idx, array(X,...,X)] <-- second element is np.array
 
-            if "forces" in self.training_properties:
-                # calculate absolute error of forces, where we compute the mean over the n_atoms x 3 dimensions
-                tmp_forces    = torch.mean ( torch.mean(torch.abs(pred["forces"] - batch["forces"]), dim=(0)) , dim=(0,) )
-                tmp_forces    = tmp_forces.detach().cpu().numpy() # detach from graph & convert to numpy
-                forces_error += tmp_forces
+            # checking if an array is heterogeneous
+            heterogeneous_array = False
+            fi = preds['pred_forces'][0][1].shape[1]  # second item of the shape
+            for item in preds['pred_forces']:
+                if fi != item[1].shape[1]: heterogeneous_array = True
 
-            if "dipole_moment" in self.training_properties:
-                # calculate absolute error of dipole_moment vector mean: n_atoms x 3 dimensions
-                preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
-                preds["pred_dipole_moment"].append((idx, pred["dipole_moment"].detach().cpu().numpy()))
-                tmp_dipole_moment    = torch.mean(torch.abs(pred["dipole_moment"] - batch["dipole_moment"]), dim=(0,))
-                tmp_dipole_moment    = tmp_dipole_moment.detach().cpu().numpy()
-                dipole_moment_error += tmp_dipole_moment
+            if heterogeneous_array:
+                nparrs_list: List[np.array] = []
+                for idx, _ in enumerate(preds['pred_forces']):
+                    # [mean_over_X, mean_over_Y, mean_over_Z] <-- list of this
+                    nparrs_list.append( np.mean( np.abs(preds['pred_forces'][idx][1] - preds['orig_forces'][idx][1])[0], axis=(0,) ) )
+                forces_error = torch.Tensor( np.mean(nparrs_list, axis=(0,)) )
+            else:
+                # <Warning> In heterogeneous arrays this trick does not work!
+                row_size    = preds['pred_forces'][0][1].shape[1]  # 1 --> second dim
+                pred_forces = np.array(preds["pred_forces"], dtype=[('idx', 'i8'), ('xyz', 'f8', (row_size, 3))])
+                orig_forces = np.array(preds["orig_forces"], dtype=[('idx', 'i8'), ('xyz', 'f8', (row_size, 3))])
+                forces_error = torch.Tensor ( np.mean ( np.mean( np.abs(pred_forces['xyz'] - orig_forces['xyz']), axis=(0,) ), axis=(0,) ) )
 
-            idx+=1
+        if "dipole_moment" in self.training_properties:
+            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
 
-        # division by number of samples
-        energy_error        /= samples_to_account
-        forces_error        /= samples_to_account
-        dipole_moment_error /= samples_to_account
+            # np.array:[[<axis_mean_x>, <axis_mean_y>, <axis_mean_z>]]
+            dipole_moment_error = torch.Tensor( np.mean(np.abs(pred_dipole_moment['xyz'] - orig_dipole_moment['xyz']), axis=(0,))[0]) # take internal array [[internal]]
+            samples_to_account = len(orig_dipole_moment)
 
+        if "dipole_moment_magnitude" in self.training_properties:
+            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=np.float64)
+            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=np.float64)
+
+            # np.array: <axis_mean>
+            dipole_moment_error = torch.Tensor([np.mean(np.abs(pred_dipole_moment[:,1] - orig_dipole_moment[:,1]), axis=(0,))]) # Tensor[internal]
+            samples_to_account = len(orig_dipole_moment)
+
+        # TODO: 24?
         print_function(f"""
 
 Test LOSS | epochs {self.storer.get(self.name4storer)} | samples into account: #{samples_to_account}:
-          <energy> [{self.units_dimensions["ENERGY"]}]: {str(energy_error):>25}
-          <forces> [{self.units_dimensions["FORCE"]}]: {str(forces_error):>25}
-          <dipole moment> [{self.units_dimensions["DIPOLE_MOMENT"]}]: {str(dipole_moment_error):>25}
+          <energy> [{self.units["ENERGY"]}]: {str(energy_error):>24}
+          <forces> [{self.units["FORCE"]}]: {str(forces_error):>25}
+          <dipole moment> [{self.units["DIPOLE_MOMENT"]}]: {str(dipole_moment_error):>25}
 
         """)
 
         # Plotting
-        if not self.using_matplotlib and self.plot_enabled:
+        if (self.plot_enabled and not self.using_matplotlib) and need2plot:
             network_name = key_prefix = str(self.network_name)
             epochs_done  = self.storer.get(self.name4storer)
+            key_name = f"{key_prefix.replace('_','')} on test dataset: epochs:{str(epochs_done)} | predicted:"
 
-            pred_energy        = np.array(preds["pred_energy"], dtype=float)
-            sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
-            orig_energy        = np.array(preds["orig_energy"], dtype=float)
-            sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
-            # dp
-            pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-            sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
-            orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
-            sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
+            if "energy" in self.training_properties:
+                # energy
+                pred_energy        = np.array(preds["pred_energy"], dtype=np.float64)
+                sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
+                orig_energy        = np.array(preds["orig_energy"], dtype=np.float64)
+                sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
 
+                key_name += f"{len(pred_energy)}"
 
-            # energy
-            key_name = f"{key_prefix} on test dataset: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
-            self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
-                                       x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
-            #
-            # diag
-            self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
-                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
-                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
-            self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
-                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
-                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
-            self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
-                                       x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
-                                       y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+                self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
+                                           x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
+
+            if "dipole_moment" in self.training_properties:
+                pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment["idx"].argsort()]
+                orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=[('idx', 'i8'), ('xyz', 'f8', (1, 3))])
+                sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment["idx"].argsort()]
+                # diag
+                key_name += f"{len(pred_dipole_moment)}"
+                self.plotter_progress.plot(page="diag_dp_x", key_name = key_name, plotLine=False,
+                                           x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,0]),
+                                           y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,0]))
+                self.plotter_progress.plot(page="diag_dp_y", key_name = key_name, plotLine=False,
+                                           x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,1]),
+                                           y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,1]))
+                self.plotter_progress.plot(page="diag_dp_z", key_name = key_name, plotLine=False,
+                                           x=np.concatenate(sorted_orig_dipole_moment["xyz"][...,2]),
+                                           y=np.concatenate(sorted_pred_dipole_moment["xyz"][...,2]))
+
+            if "dipole_moment_magnitude" in self.training_properties:
+                pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=np.float64)
+                sorted_pred_dipole_moment = pred_dipole_moment[pred_dipole_moment[:,0].argsort()]
+                orig_dipole_moment        = np.array(preds["orig_dipole_moment"], dtype=np.float64)
+                sorted_orig_dipole_moment = orig_dipole_moment[orig_dipole_moment[:,0].argsort()]
+                # diag
+                key_name += f"{len(pred_dipole_moment)}"
+                self.plotter_progress.plot(page="diag_dp_magnitude", key_name = key_name, plotLine=False,
+                                           x=sorted_orig_dipole_moment[:,1],
+                                           y=sorted_pred_dipole_moment[:,1])
 
     def prepare_network(self, redo:bool = False) -> None:
         self.create_model_path(redo=redo)
         self.gpu_info.notify()
-        self.print_info()
         self.train_model()
 
