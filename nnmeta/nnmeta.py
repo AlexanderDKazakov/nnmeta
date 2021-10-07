@@ -24,24 +24,24 @@
 
 from dataclasses import dataclass, field
 from typing      import List, Any, Callable
-from torch       import Tensor
+
+import os, sys, shutil, re
+from collections import defaultdict
 from ase         import Atoms
 from ase.io      import read
 from ase.units   import Bohr,kJ,Hartree,mol,kcal
 
-import numpy   as np
-import netpack as pack
-
 import torch
-import os, sys, shutil, re
-from netpack.atomistic.model import AtomisticModel
-from netpack                 import AtomsLoader
-from netpack                 import AtomsData
-from netpack.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
-from netpack.train           import Trainer, CSVHook, ReduceLROnPlateauHook
-from netpack.train           import build_mse_loss, build_mae_loss, build_sae_loss
+import numpy   as np
+import nnpackage as pack
+
+from torch                   import Tensor
+from nnpackage.atomistic.model import AtomisticModel
+from nnpackage                 import AtomsLoader, AtomsData
+from nnpackage.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
+from nnpackage.train           import Trainer, CSVHook, ReduceLROnPlateauHook
+from nnpackage.train           import build_mse_loss, build_mae_loss, build_sae_loss
 from storer                  import Storer
-from collections             import defaultdict
 
 import warnings
 warnings.filterwarnings("ignore")

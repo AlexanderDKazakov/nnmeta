@@ -1,6 +1,6 @@
 # NNmeta
 
-NNmeta is created in order to use [NetPack package](https://github.com/AlexanderDKazakov/schnetpack). 
+NNmeta is created in order to use [NNPackage](https://github.com/AlexanderDKazakov/schnetpack). 
 
 ## Installation
 
