@@ -82,9 +82,9 @@ info = dict(
        
        # cross-check with next files
        check_list_files = {
-       	# this file should lie in the same `xyz` dir
+       # this file should lie in the same `xyz` dir
        	"samples_for_cc.xyz" : dict(num_points = 1000),
-   		}	
+       }	
 	)
 )
 
