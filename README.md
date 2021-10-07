@@ -96,6 +96,5 @@ nn.prepare_network()
 Feel free to contribute to the project, but please create initially an issue with detailed problem and way to resolve it. 
 
 ## License
-----
 
 MIT
