@@ -224,7 +224,7 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.5.10"
+    __version__                  : str            = "1.6.3"
     debug                        : bool           = False
     _should_train                : bool           = True
     _force_gpu                   : bool           = False
