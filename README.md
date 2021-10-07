@@ -8,7 +8,6 @@ NNmeta is created in order to use [NetPack package](https://github.com/Alexander
 
 ```
 pip3 install nnmeta
-
 ```
 
 ### Install from source
@@ -24,14 +23,12 @@ cd nnmeta
 
 ```
 pip3 install -r requirements.txt
-
 ```
 
 #### Install NNmeta
 
 ```
 pip3 install .
-
 ```
 
 ## Usage
