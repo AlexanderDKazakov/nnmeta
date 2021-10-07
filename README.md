@@ -53,7 +53,7 @@ info = dict(
 	runner = {  # network name
 		# data source [extended xyz file]; used for converting to DB [internal usage]
 		# "filename" : {"range" ex. [from:to:step], epochs should be done}
-		"samples.xyz" : {":", 20},  # train `runner` nn on all samples of `samples.xyz` 20 epochs
+		"samples.xyz" : {":" : 20},  # train `runner` nn on all samples of `samples.xyz` 20 epochs
 	},
 	
 	runner_features = dict(
