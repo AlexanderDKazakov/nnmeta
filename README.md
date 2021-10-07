@@ -80,11 +80,11 @@ info = dict(
 		predict_each_epoch                 = 200,
 		validate_each_epoch                = 30,
        
-       # cross-check with next files
-       check_list_files = {
-       # this file should lie in the same `xyz` dir
-       	"samples_for_cc.xyz" : dict(num_points = 1000),
-       }	
+   		# cross-check with next files
+       		check_list_files = {
+		# this file should lie in the same `xyz` dir
+			"samples_for_cc.xyz" : dict(num_points = 1000),
+       		}
 	)
 )
 
