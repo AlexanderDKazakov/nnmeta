@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name         = 'nnmeta',
-    version      = '1.6.3',
+    version      = '1.7.1',
     author       = 'Alexander D. Kazakov',
     author_email = 'alexander.d.kazakov@gmail.com',
     description  = 'NNmeta based on Netpack',

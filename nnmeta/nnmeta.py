@@ -28,21 +28,22 @@ from typing      import List, Any, Callable
 import os, sys, shutil, re
 from collections import defaultdict
 from ase         import Atoms
-from ase.io      import read
+from ase.io      import read, write
 from ase.units   import Bohr,kJ,Hartree,mol,kcal
 
 import torch
 import numpy   as np
 import nnpackage as pack
 
-from torch                   import Tensor
+from torch                     import Tensor
 from nnpackage.atomistic.model import AtomisticModel
 from nnpackage                 import AtomsLoader, AtomsData
 from nnpackage.train.metrics   import MeanAbsoluteError, RootMeanSquaredError, MeanSquaredError
 from nnpackage.train           import Trainer, CSVHook, ReduceLROnPlateauHook
 from nnpackage.train           import build_mse_loss, build_mae_loss, build_sae_loss
-from storer                  import Storer
+from storer                    import Storer
 
+import copy
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -52,6 +53,7 @@ else:    print_function = print
 
 from subprocess import Popen, PIPE
 import xml.etree.ElementTree as ET
+
 
 DM = {
     0 : "dipole_moment_x",
@@ -224,7 +226,7 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.6.3"
+    __version__                  : str            = "1.7.1"
     debug                        : bool           = False
     _should_train                : bool           = True
     _force_gpu                   : bool           = False
@@ -287,15 +289,19 @@ class NNClass:
 
     train_samples_percent        : np.float64     = 60.0
     valid_samples_percent        : np.float64     = 20.0
-    _number_train_samples         :int             = 0
-    _number_valid_samples         :int             = 0
+    _number_train_samples        : int            = 0
+    _number_valid_samples        : int            = 0
     units = dict(
         ENERGY        = "Hartree",
         FORCE         = "Hartree/Bohr",
         DIPOLE_MOMENT = "Debye"
     )
 
-    check_list_files              : dict          = field(default_factory=dict)
+    # Downsampler
+    downsample_each_epoch        : int            = -1   # Turned off
+    downsample_threshold         : float          = None # Turned off
+
+    check_list_files             : dict          = field(default_factory=dict)
 
     def __post_init__(self):
         if self.system_path[-1] != "/": self.system_path+="/"
@@ -358,6 +364,9 @@ class NNClass:
         if self.info[kf].get("check_list_files"):                       self.check_list_files            = self.info[kf].get("check_list_files")
         if self.info[kf].get("loss_function_choice"):                   self.loss_function_choice        = self.info[kf].get("loss_function_choice")
         if self.info[kf].get("units"):                                  self.units                       = self.info[kf].get("units")
+        #
+        if self.info[kf].get("downsample_each_epoch"):                  self.downsample_each_epoch       = self.info[kf].get("downsample_each_epoch")
+        if self.info[kf].get("downsample_threshold"):                   self.downsample_threshold        = self.info[kf].get("downsample_threshold")
 
         self.check_provided_parameters()
         self._import_relevant_loss()
@@ -382,9 +391,13 @@ class NNClass:
                 pages_info["xyz_file_sub"] = dict(xname="[sample number]" , yname=f"Energy-(int)E[0], [{self.units['ENERGY']}]",)
                 pages_info["diag_energy"]  = dict(xname=f"Energy [orig], [{self.units['ENERGY']}]",
                                                   yname=f"Energy [pred], [{self.units['ENERGY']}]",)
+                pages_info["diag_energy_norm"]  = dict(xname=f"Energy/atom [orig], [{self.units['ENERGY']}]",
+                                                  yname=f"Energy/atom [pred], [{self.units['ENERGY']}]",)
+                pages_info["energy_loss_per_sample"] = dict(xname="[sample number]" , yname=f"Energy Loss, [{self.units['ENERGY']}]",)
+
                 # framework
-                pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units['ENERGY']}]",)
-                pages_info["forces_loss"]  = dict(xname="Time [s]", yname=f"Force  LOSS [{self.units['FORCE']}]",)
+                pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units['ENERGY']}]", xlog=True, ylog=True)
+                pages_info["forces_loss"]  = dict(xname="Time [s]", yname=f"Force  LOSS [{self.units['FORCE']}]" , xlog=True, ylog=True)
 
             if "dipole_moment" in self.training_properties or "dipole_moment_magnitude" in self.training_properties:
                 # framework
@@ -416,7 +429,7 @@ class NNClass:
                                                                yname=f"\\Delta Dipole moment [z] [{self.units['DIPOLE_MOMENT']}]",)
 
             self.plotter_progress = Plotter(title="Check Results", pages_info=pages_info, keyFontSize = 8)
-            self.plotter_log      = Plotter(title="", engine="gnuplot")
+            #self.plotter_log      = Plotter(title="", engine="gnuplot")  # TODO: Gnuplot stabilization
 
 
     def check_provided_parameters(self) -> None:
@@ -818,7 +831,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
 
             if epoch <= epochs_done: continue
             else:
-                showed = False
+                _showed = False
                 # Training
                 self.trainer.train(device=self.device, n_epochs=1)
 
@@ -827,14 +840,15 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.storer.dump()
 
                 if epoch % self.validate_each_epoch == 0 and epoch != 0:
-                    if not showed: self.gpu_info.notify(True); showed=True
+                    if not _showed: self.gpu_info.notify(True); _showed=True
                     self.validate()
 
                 if epoch % self.predict_each_epoch == 0 and epoch != 0:
-                    if not showed: self.gpu_info.notify(True); showed=True
+                    if not _showed: self.gpu_info.notify(True); _showed=True
                     if self.compare_with_foreign_model: self.predict(indexes=indexes, xyz_file=xyz_file, path2foreign_model=self.path2foreign_model)
                     self.predict(indexes=indexes, xyz_file=xyz_file)
                     self.use_model_on_test(db_name=self._get_db_name(xyz_file=xyz_file, indexes=indexes))
+
 
         print_function(f"{self.internal_name} [model training] done.")
 
@@ -873,6 +887,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 self.validate()
                 self.predict(indexes=indexes, xyz_file=xyz_file)
                 self.use_model_on_test(db_name=db_name)
+
+                if self.downsample_threshold is not None:
+                    self.downsample(indexes=indexes, xyz_file=xyz_file)
+                #if epoch % self.downsample_each_epoch == 0 and epoch != 0:
+                #    # downsample procedure
+                #    self.downsample(indexes=indexes, xyz_file=xyz_file)
 
     def visualize_interest_region(self, indexes:str = None, samples4showing:int = 1, source_of_points:List[Atoms] = None, xyz_file:str = None) -> None:
         print_function(f"{self.internal_name} Visualizing regions of interest...")
@@ -932,6 +952,171 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                     self.plotter_progress.plot(x=x, y=y[:,0],             key_name=key_name, page="xyz_file")
                     self.plotter_progress.plot(x=x, y=(y[:,0]-y[:,0][0]), key_name=key_name, page="xyz_file_sub")
 
+    def downsample(self, indexes:str  = None, xyz_file:str = None) -> None:
+        """
+        Downsample method.
+
+        Input:
+        - indexes     [None] -- XX:XX:XX indexes for start / end / step
+        - xyz_file    [None] -- path to xyz file
+        """
+        def compute_and_account(best_model, batch, idx):
+            ## move batch to GPU, if necessary
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            number_atoms = len(batch['_atomic_numbers'][0])
+            pred  = best_model(batch)
+
+            if "energy"        in self.training_properties:
+                preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
+                preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
+                # norm
+                preds["orig_energy_norm"].append((idx, batch["energy"].detach().cpu().numpy()/number_atoms ))
+                preds["pred_energy_norm"].append((idx, pred["energy"].detach().cpu().numpy())/number_atoms )
+            if "dipole_moment" in self.training_properties:
+                preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
+                preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
+            if "dipole_moment_magnitude" in self.training_properties:
+                preds["orig_dipole_moment"].append((idx, batch["dipole_moment_magnitude"].detach().cpu().numpy()))
+                preds["pred_dipole_moment"].append((idx,  pred["dipole_moment_magnitude"].detach().cpu().numpy()))
+
+        network_name = key_prefix = str(self.network_name)
+        model_path   = os.path.join(self.model_path, 'best_model')
+        epochs_done  = self.storer.get(self.name4storer)
+
+        # creating folder for model test
+        print_function(f"{self.internal_name} Downsampling based on [{network_name}]...")
+
+        test_path = os.path.join(self.test_path, network_name); os.makedirs(test_path, exist_ok=True)
+
+        #check_xyz_file = list(self.check_list_files.keys()) + [xyz_file]
+        check_xyz_file = [xyz_file]  # Do we need downsampling on check_list files? Currently the answer is no
+
+        for xyz_file in check_xyz_file:
+            print_function(f"Reading {xyz_file}...")
+            self.prepare_databases(redo=False, index=":", xyz_file=xyz_file)
+            #db_name = f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
+            db_path_fname = os.path.join(self.db_path, self._get_db_name(xyz_file=xyz_file, indexes=indexes))
+            print_function(f"Loading... | {db_path_fname}")
+            #
+            #self.SUBSAMPLES_LOADER = subsamples_loader_train = AtomsLoader(self.train_samples, batch_size=1)
+            self.SUBSAMPLES_LOADER = subsamples_loader = AtomsLoader(self.samples, batch_size=1)
+            #subsamples_loader_valid = AtomsLoader(self.valid_samples, batch_size=1)
+            #subsamples_loader_test = AtomsLoader(self.test_samples, batch_size=1)
+            #idxs = self.idx4vis  # idx for downsample self.idx4vis -- visualization
+            idxs = len(subsamples_loader)  # idx for downsample self.idx4vis -- visualization
+
+            #if xyz_file in self.db_epochs.keys():
+            #    self.SUBSAMPLES_LOADER = subsamples_loader = AtomsLoader(self.train_samples, batch_size=1)
+            #    idxs = self.idx4vis  # idx for downsample self.idx4vis -- visualization
+            #    #trained_subset = True
+            # check_list file
+            #else:
+            #    samples = AtomsData(db_path_fname, load_only=self.training_properties)  # pick the db
+            #    subsamples, idxs = pack.get_subset(
+            #        data         = samples,
+            #        num_samples  = self.check_list_files[xyz_file]['num_points'], #self.visualize_points_from_nn,
+            #    )
+            #    subsamples_loader = AtomsLoader(subsamples, batch_size=1)
+            #    trained_subset = False
+            #    # use model on test
+            #    self.use_model_on_test(_subsamples_loader = subsamples_loader, need2plot=False)
+
+            print_function(f"[{network_name}] Loading the last best model")
+            best_model = pack.utils.load_model(model_path, map_location=self.device)
+
+            print_function(f"[Downsampling] Predicting on subset [#{len(subsamples_loader)}]...")
+            self.preds = preds = defaultdict(list)
+
+            #if not trained_subset: #len(subsamples_loader) == self.visualize_points_from_nn:
+            #    for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")): compute_and_account(best_model, batch, idxs[idx])
+            #else:
+            #    for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")):
+            #        if idx in idxs: compute_and_account(best_model, batch, idx)
+
+            for idx, batch in enumerate(tqdm(subsamples_loader, f"[Downsampling] Predicting [{self.device}]")):
+                #if idx in idxs: compute_and_account(best_model, batch, idx)
+                compute_and_account(best_model, batch, idx)
+
+            if 'energy' in self.training_properties:
+                pred_energy        = np.array(preds["pred_energy"], dtype=np.float64)
+                sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
+                orig_energy        = np.array(preds["orig_energy"], dtype=np.float64)
+                sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
+                ##
+                #pred_energy = np.array(preds["pred_energy"], dtype=[('idx','i8'),('val', 'f8')])
+                #orig_energy = np.array(preds["orig_energy"], dtype=[('idx','i8'),('val', 'f8')])
+
+                #samples_to_account = len(orig_energy)
+                #energy_error = np.sum( np.abs(pred_energy['val'] - orig_energy['val']) ) / samples_to_account
+                ##
+
+                #
+                self.CHECK_DELTA = delta_energy = np.array(orig_energy, copy=True) # Copy array
+                delta_energy[:,1] = pred_energy[:,1] - orig_energy[:,1]  # Pred - Orig
+                #
+                self.OUTSIDE = outside = delta_energy[ abs(delta_energy[:,1]) > self.downsample_threshold]  # idx, energy
+                self.INSIDE  = inside  = delta_energy[ abs(delta_energy[:,1]) < self.downsample_threshold]  # idx, energy
+                # # # TEMPORARLY
+                #self.preds_copy =  copy.deepcopy(self.preds)
+
+                # CHECK LOSS
+                pred_energy = np.array(self.preds["pred_energy"], dtype=[('idx','i8'),('val', 'f8')])
+                orig_energy = np.array(self.preds["orig_energy"], dtype=[('idx','i8'),('val', 'f8')])
+
+                samples_to_account = len(orig_energy)
+                energy_error = np.sum( np.abs(pred_energy['val'] - orig_energy['val']) ) / samples_to_account
+
+                print("Energy LOSS: ", energy_error)
+
+                # REDUCED ARRAY
+                self.preds.clear()
+                for idx, batch in enumerate(tqdm(subsamples_loader, f"[Downsampling] Predicting [{self.device}]")):
+                    if idx in inside[:,0]: compute_and_account(best_model, batch, idx)
+
+                #pred_energy_new        = np.array(self.preds["pred_energy"], dtype=np.float64)
+                #sorted_pred_energy_new = pred_energy[pred_energy[:,0].argsort()]
+                #orig_energy_new        = np.array(self.preds["orig_energy"], dtype=np.float64)
+                #sorted_orig_energy_new = orig_energy[orig_energy[:,0].argsort()]
+
+                # CHECK LOSS
+                pred_energy = np.array(self.preds["pred_energy"], dtype=[('idx','i8'),('val', 'f8')])
+                orig_energy = np.array(self.preds["orig_energy"], dtype=[('idx','i8'),('val', 'f8')])
+
+                samples_to_account = len(orig_energy)
+                energy_error = np.sum( np.abs(pred_energy['val'] - orig_energy['val']) ) / samples_to_account
+
+                print("REDUCED Energy LOSS: ", energy_error)
+
+                # saving outside and inside samples
+
+                inside_len  = len(inside[:,0])
+                outside_len = len(outside[:,0])
+
+                # TODO: Forces, dipole_moment? internal_energy -> energy
+
+                for idx, batch in enumerate(tqdm(subsamples_loader, f"[Downsampling] Saving inside [{self.device}]")):
+                    if idx in inside[:,0]:
+                        positions = batch['_positions'].squeeze()
+                        _number_of_atoms = positions.shape[0] #
+                        a = Atoms(symbols="C"+str(_number_of_atoms), positions=positions)
+                        if "energy" in batch.keys(): a.set_internal_potential_energy(batch['energy'].squeeze().item())
+                        if "forces" in batch.keys(): a.set_internal_forces(batch['forces'].squeeze().numpy())
+                        if "dipole_moment" in batch.keys(): a.set_internal_dipole_moment(batch['dipole_moment'].squeeze())
+
+                        write(filename=f"{self.xyz_path}/inside_model{self.network_name}_threshold{self.downsample_threshold}_{str(inside_len)}.extxyz", images=a, format="extxyz", append=True)
+
+                for idx, batch in enumerate(tqdm(subsamples_loader, f"[Downsampling] Saving outside [{self.device}]")):
+                    if idx in outside[:,0]:
+                        positions = batch['_positions'].squeeze()
+                        _number_of_atoms = positions.shape[0] #
+                        a = Atoms(symbols="C"+str(_number_of_atoms), positions=positions)
+                        if "energy" in batch.keys(): a.set_internal_potential_energy(batch['energy'].squeeze().item())
+                        if "forces" in batch.keys(): a.set_internal_forces(batch['forces'].squeeze().numpy())
+                        if "dipole_moment" in batch.keys(): a.set_internal_dipole_moment(batch['dipole_moment'].squeeze())
+                        write(filename=f"{self.xyz_path}/outside_model{self.network_name}_threshold{self.downsample_threshold}_{str(outside_len)}.extxyz", images=a, format="extxyz", append=True)
+
+
+
 
     def predict(self, indexes:str  = None, xyz_file:str = None, path2foreign_model:str = None, need2plot:bool = True) -> None:
         """
@@ -951,11 +1136,17 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             def compute_and_account(best_model, batch, idx):
                 ## move batch to GPU, if necessary
                 batch = {k: v.to(self.device) for k, v in batch.items()}
+                number_atoms = len(batch['_atomic_numbers'][0])
                 pred  = best_model(batch)
 
                 if "energy"        in self.training_properties:
                     preds["orig_energy"].append((idx, batch["energy"].detach().cpu().numpy() ))
                     preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
+                    # norm
+                    orig_energy_norm = batch["energy"].detach().cpu().numpy()/number_atoms
+                    pred_energy_norm = pred["energy"].detach().cpu().numpy()/number_atoms
+                    preds["orig_energy_norm"].append((idx, orig_energy_norm))
+                    preds["pred_energy_norm"].append((idx, pred_energy_norm))
                 if "dipole_moment" in self.training_properties:
                     preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
                     preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
@@ -1010,7 +1201,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 best_model = pack.utils.load_model(model_path, map_location=self.device)
 
                 print_function(f"Predicting on subset [#{len(idxs)}]...")
-                self.preds = preds = defaultdict(list)
+                self.CHECK = self.preds = preds = defaultdict(list)
 
                 if not trained_subset: #len(subsamples_loader) == self.visualize_points_from_nn:
                     for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")): compute_and_account(best_model, batch, idxs[idx])
@@ -1030,6 +1221,11 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         sorted_pred_energy = pred_energy[pred_energy[:,0].argsort()]
                         orig_energy        = np.array(preds["orig_energy"], dtype=np.float64)
                         sorted_orig_energy = orig_energy[orig_energy[:,0].argsort()]
+                        # norm
+                        pred_energy_norm        = np.array(preds["pred_energy_norm"], dtype=np.float64)
+                        sorted_pred_energy_norm = pred_energy_norm[pred_energy_norm[:,0].argsort()]
+                        orig_energy_norm        = np.array(preds["orig_energy_norm"], dtype=np.float64)
+                        sorted_orig_energy_norm = orig_energy_norm[orig_energy_norm[:,0].argsort()]
 
                         if trained_subset: key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
                         else:              key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(pred_energy))}"
@@ -1040,10 +1236,13 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         self.plotter_progress.plot(page="delta_energy", key_name = key_name,
                                                    x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
 
-                        self.CHECK1 = sorted_orig_energy
-                        self.CHECK2 = sorted_pred_energy
+                        self.plotter_progress.plot(page="energy_loss_per_sample", key_name = key_name,
+                                                   x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
+
                         self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
                                                    x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
+                        self.plotter_progress.plot(page="diag_energy_norm", key_name = key_name, plotLine=False,
+                                                   x=sorted_orig_energy_norm[:, 1], y=sorted_pred_energy_norm[:,1])
 
                     if 'dipole_moment_magnitude' in self.training_properties:
                         pred_dipole_moment        = np.array(preds["pred_dipole_moment"], dtype=np.float64)
