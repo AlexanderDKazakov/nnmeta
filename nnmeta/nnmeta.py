@@ -226,7 +226,7 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.7.1"
+    __version__                  : str            = "1.7.2"
     debug                        : bool           = False
     _should_train                : bool           = True
     _force_gpu                   : bool           = False
@@ -393,7 +393,7 @@ class NNClass:
                                                   yname=f"Energy [pred], [{self.units['ENERGY']}]",)
                 pages_info["diag_energy_norm"]  = dict(xname=f"Energy/atom [orig], [{self.units['ENERGY']}]",
                                                   yname=f"Energy/atom [pred], [{self.units['ENERGY']}]",)
-                pages_info["energy_loss_per_sample"] = dict(xname="[sample number]" , yname=f"Energy Loss, [{self.units['ENERGY']}]",)
+                pages_info["energy_loss_per_sample"] = dict(xname="[sample number]" , yname=f"\\Delta Energy = Pred - Orig, [{self.units['ENERGY']}]", )
 
                 # framework
                 pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units['ENERGY']}]", xlog=True, ylog=True)
@@ -971,7 +971,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 preds["pred_energy"].append((idx, pred["energy"].detach().cpu().numpy()) )
                 # norm
                 preds["orig_energy_norm"].append((idx, batch["energy"].detach().cpu().numpy()/number_atoms ))
-                preds["pred_energy_norm"].append((idx, pred["energy"].detach().cpu().numpy())/number_atoms )
+                preds["pred_energy_norm"].append((idx, pred["energy"].detach().cpu().numpy() /number_atoms ))
             if "dipole_moment" in self.training_properties:
                 preds["orig_dipole_moment"].append((idx, batch["dipole_moment"].detach().cpu().numpy()))
                 preds["pred_dipole_moment"].append((idx,  pred["dipole_moment"].detach().cpu().numpy()))
@@ -1051,7 +1051,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 ##
 
                 #
-                self.CHECK_DELTA = delta_energy = np.array(orig_energy, copy=True) # Copy array
+                delta_energy = np.array(orig_energy, copy=True) # Copy array
                 delta_energy[:,1] = pred_energy[:,1] - orig_energy[:,1]  # Pred - Orig
                 #
                 self.OUTSIDE = outside = delta_energy[ abs(delta_energy[:,1]) > self.downsample_threshold]  # idx, energy
@@ -1201,7 +1201,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 best_model = pack.utils.load_model(model_path, map_location=self.device)
 
                 print_function(f"Predicting on subset [#{len(idxs)}]...")
-                self.CHECK = self.preds = preds = defaultdict(list)
+                self.preds = preds = defaultdict(list)
 
                 if not trained_subset: #len(subsamples_loader) == self.visualize_points_from_nn:
                     for idx, batch in enumerate(tqdm(subsamples_loader, f"Predicting [{self.device}]")): compute_and_account(best_model, batch, idxs[idx])
@@ -1233,11 +1233,20 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                                                    x=sorted_pred_energy[:,0], y=sorted_pred_energy[:,1],  animation=True)
                         self.plotter_progress.plot(page="xyz_file_sub", key_name = key_name,
                                                    x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_pred_energy[:,1][0]), )
-                        self.plotter_progress.plot(page="delta_energy", key_name = key_name,
-                                                   x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
+                        #self.plotter_progress.plot(page="delta_energy", key_name = key_name,
+                        #                           x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
 
+                        _energy_loss_per_sample = sorted_pred_energy[:,1] - sorted_orig_energy[:,1]
+                        sorted_pred_energy[:, 0]
+                        # plot mean and std
+                        self.plotter_progress.plot(page="energy_loss_per_sample", key_name = key_name+"mean", plotLine=False,
+                                                   x=sorted_pred_energy[:,0], y= list(zip(
+                                                       [np.mean(_energy_loss_per_sample) for _ in range(len(sorted_pred_energy[:,0]))],
+                                                       [np.std(_energy_loss_per_sample, ddof=1) for _ in range(len(sorted_pred_energy[:,0]))])),
+                                                   errorStyle="fillvert",
+                                                   )
                         self.plotter_progress.plot(page="energy_loss_per_sample", key_name = key_name,
-                                                   x=sorted_pred_energy[:,0], y=(sorted_pred_energy[:,1] - sorted_orig_energy[:,1]),)
+                                                   x=sorted_pred_energy[:,0], y=_energy_loss_per_sample,)
 
                         self.plotter_progress.plot(page="diag_energy", key_name = key_name, plotLine=False,
                                                    x=sorted_orig_energy[:, 1], y=sorted_pred_energy[:,1])
