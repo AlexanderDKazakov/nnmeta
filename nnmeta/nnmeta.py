@@ -23,7 +23,7 @@
 ##*
 
 from dataclasses import dataclass, field
-from typing      import List, Any, Callable
+from typing      import List, Dict, Any, Callable
 
 import os, sys, shutil, re
 from collections import defaultdict
@@ -61,9 +61,10 @@ DM = {
     2 : "dipole_moment_z",
 }
 
-AVAILABLE_ENERGY_UNITS = ["hartree", "kj/mol", "kcal/mol", "ev"]
-AVAILABLE_FORCE_UNITS  = ["bohr", "angstrom"]
-AVAILABLE_DM_UNITS     = ["debye"]
+AVAILABLE_ENERGY_UNITS     = ("hartree", "kj/mol", "kcal/mol", "ev",)
+AVAILABLE_FORCE_UNITS      = ("bohr", "angstrom")
+AVAILABLE_DM_UNITS         = ("debye",)
+AVAILABLE_KEYS_NN_SETTINGS = ("index_epochs", "index_epochs_weight", "weight")
 
 
 CONVERTER = {
@@ -226,15 +227,17 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "1.7.2"
+    __version__                  : str            = "2.0.0"
     debug                        : bool           = False
     _should_train                : bool           = True
     _force_gpu                   : bool           = False
     _force_map                   : List[int]      = None
+    _index_epoch_weight_key      : Dict           = field(default_factory=dict)
 
     internal_name                : str            = "[NNClass]"
     system_path                  : str            = "."
     plot_enabled                 : bool           = False
+    mean_std_use                 : bool           = True
     meta                         : bool           = True
     storer                       : object         = None
     device                       : str            = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -244,7 +247,8 @@ class NNClass:
     #
     db_properties                : tuple          = ("energy", "forces", "dipole_moment")  # properties look for database
     training_properties          : tuple          = ("energy", "forces", "dipole_moment")  # properties used for training
-    db_epochs                    : dict           = field(default_factory=dict)
+    #db_epochs                    : dict           = field(default_factory=dict)
+    nn_settings                  : dict           = field(default_factory=dict)
     training_progress            : dict           = field(default_factory=dict)
     loss_function_choice         : str            = "mse" # Available: ["mse", "mae", "sae", .?.]
     loss_fun_builder             : Callable       = None
@@ -321,7 +325,7 @@ class NNClass:
         # info
         kf = self.network_name+"_features"
         try:
-            db_epochs = self.info[self.network_name]
+            _ = self.info[self.network_name]
         except KeyError:
             available_nns = []
             for k in self.info:
@@ -331,7 +335,9 @@ class NNClass:
             print_function(f"Known NNs: {available_nns}")
             sys.exit(1)
 
-        self.db_epochs = self.info[self.network_name]
+        #self.db_epochs = self.info[self.network_name]
+        self.nn_settings = self.info[self.network_name]
+
         if self.info[kf].get("_should_train")              is not None: self._should_train               = self.info[kf].get("_should_train")
         if self.info[kf].get("_force_gpu")                 is not None: self._force_gpu                  = self.info[kf].get("_force_gpu")
         if self.info[kf].get("_force_map")                 is not None: self._force_map                  = self.info[kf].get("_force_map")
@@ -349,6 +355,7 @@ class NNClass:
         if self.info[kf].get("db_properties"):                          self.db_properties               = self.info[kf].get("db_properties")
         if self.info[kf].get("training_properties"):                    self.training_properties         = self.info[kf].get("training_properties")
         if self.info[kf].get("loss_tradeoff"):                          self.loss_tradeoff               = self.info[kf].get("loss_tradeoff")
+        if self.info[kf].get("mean_std_use"):                           self.mean_std_use                = self.info[kf].get("mean_std_use")
 
         if self.info[kf].get("n_layers_energy_force"):                  self.n_layers_energy_force       = self.info[kf].get("n_layers_energy_force")
         if self.info[kf].get("n_neurons_energy_force"):                 self.n_neurons_energy_force      = self.info[kf].get("n_neurons_energy_force")
@@ -367,6 +374,7 @@ class NNClass:
         #
         if self.info[kf].get("downsample_each_epoch"):                  self.downsample_each_epoch       = self.info[kf].get("downsample_each_epoch")
         if self.info[kf].get("downsample_threshold"):                   self.downsample_threshold        = self.info[kf].get("downsample_threshold")
+
 
         self.check_provided_parameters()
         self._import_relevant_loss()
@@ -393,7 +401,8 @@ class NNClass:
                                                   yname=f"Energy [pred], [{self.units['ENERGY']}]",)
                 pages_info["diag_energy_norm"]  = dict(xname=f"Energy/atom [orig], [{self.units['ENERGY']}]",
                                                   yname=f"Energy/atom [pred], [{self.units['ENERGY']}]",)
-                pages_info["energy_loss_per_sample"] = dict(xname="[sample number]" , yname=f"\\Delta Energy = Pred - Orig, [{self.units['ENERGY']}]", )
+                pages_info["energy_loss_per_sample"]        = dict(xname="[sample number]" , yname=f"\\Delta Energy = Pred - Orig, [{self.units['ENERGY']}]", )
+                pages_info["energy_loss_per_sample_inside"] = dict(xname="[sample number]" , yname="\\Delta Energy_{inside} = Pred - Orig, "f"[{self.units['ENERGY']}]", )
 
                 # framework
                 pages_info["energy_loss"]  = dict(xname="Time [s]", yname=f"Energy LOSS [{self.units['ENERGY']}]", xlog=True, ylog=True)
@@ -437,6 +446,7 @@ class NNClass:
         # 1
         if (self.train_samples_percent + self.valid_samples_percent) >= 100:
             ok, mess = False, "Training[%] + Validation[%] have to be smaller than 100% | The rest samples are for tests purpose."
+        if not ok: print_function(mess); sys.exit(1)
         # 2
         # units
         if self.units["ENERGY"].lower() in AVAILABLE_ENERGY_UNITS:              ok1 = True;  mess1 = ""
@@ -447,8 +457,26 @@ class NNClass:
         else:                                                                   ok3 = False; mess3 = f"Not available dipole moment units [{self.units['DIPOLE_MOMENT']}];"
         ok   = ok1 and ok2 and ok3
         mess = mess1 + mess2 + mess3
-
         if not ok: print_function(mess); sys.exit(1)
+        # 3
+        for fs in self.nn_settings:
+            _keys = self.nn_settings[fs].keys()
+            for _key in _keys:
+                if _key not in AVAILABLE_KEYS_NN_SETTINGS:
+                    ok, mess = False, f"Such key [{_key}] is not available. Consider from: {AVAILABLE_KEYS_NN_SETTINGS}"
+                    if not ok: print_function(mess); sys.exit(1)
+            # cross
+            if "index_epochs" in _keys and "index_epochs_weight" in _keys:
+                ok, mess = False, f"It is not allowed to use both 'index_epochs' and 'index_epochs_weight' at the same time."
+                if not ok: print_function(mess); sys.exit(1)
+            #
+            #
+            if   "index_epochs"        in _keys: right_key = "index_epochs"
+            elif "index_epochs_weight" in _keys: right_key = "index_epochs_weight"
+            else:
+                ok, mess = False, f"You need provide either 'index_epochs' or 'index_epochs_weight' key for start training."
+                if not ok: print_function(mess); sys.exit(1)
+            self._index_epoch_weight_key[fs] = right_key
 
     def _import_relevant_loss(self) -> None:
         if   self.loss_function_choice == "mse": self.loss_fun_builder = build_mse_loss
@@ -507,7 +535,6 @@ class NNClass:
 
         DB INFO:
             PROPERTIES                  :   {self.db_properties}
-            [INDEXES : EPOCHS]          :   {self.db_epochs.items()}
 
         PATHS:
             XYZ                         :   {self.xyz_path}
@@ -515,7 +542,11 @@ class NNClass:
             MODEL [GENERAL]             :   {self.general_models_path}
             SPLITS                      :   {self.split_path}
 
+        NN SETTINGS:
+            {self.nn_settings}
+
         """)
+            #[INDEXES : EPOCHS]          :   {self.db_epochs.items()}
         self.storer.show()
 
     def create_model_path(self, redo:bool = False) -> None:
@@ -564,9 +595,9 @@ class NNClass:
         time_ = self.training_progress['time'] - self.training_progress['time'][0]
 
         # Load the validation MAEs
-        if 'energy'        in self.training_properties: energy_loss        = self.training_progress['energy']
-        if 'forces'        in self.training_properties: forces_loss        = self.training_progress['forces']
-        if 'dipole_moment' in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment']
+        if 'energy'                  in self.training_properties: energy_loss        = self.training_progress['energy']
+        if 'forces'                  in self.training_properties: forces_loss        = self.training_progress['forces']
+        if 'dipole_moment'           in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment']
         if "dipole_moment_magnitude" in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment_magnitude']
 
 
@@ -740,20 +771,30 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
             if "energy" in self.training_properties or "forces" in self.training_properties:
 
                 per_atom = dict(energy=True, forces=False, dipole_moment=False)
-                try:
-                    means, stddevs = self.train_loader.get_statistics(property_names  = list(self.training_properties),
-                                                                  divide_by_atoms = per_atom,
-                                                                  single_atom_ref = None)
-                    ## [0] !?!
-                    print_function(f"Mean atomization energy      / atom: {means['energy']} [{self.units['ENERGY']}]")
-                    print_function(f"Std. dev. atomization energy / atom: {stddevs['energy']} [{self.units['ENERGY']}]")
-                    means_energy  = means  ["energy"]
-                    stddevs_enegy = stddevs["energy"]
-                except:
-                    # Not consistent data
-                    print("[NOTE] Provided samples are not consistent!")
+
+                if not self.mean_std_use:
+                    print_function("You requested not to use 'mean' and 'std' of energy")
                     means_energy  = None
                     stddevs_enegy = None
+
+                else:
+                    try:
+                        means, stddevs = self.train_loader.get_statistics(
+                            property_names  = list(self.training_properties),
+                            divide_by_atoms = per_atom,
+                            single_atom_ref = None
+                        )
+                        ## [0] !?!
+                        print_function(f"Mean atomization energy      / atom: {means['energy']} [{self.units['ENERGY']}]")
+                        print_function(f"Std. dev. atomization energy / atom: {stddevs['energy']} [{self.units['ENERGY']}]")
+                        means_energy  = means  ["energy"]
+                        stddevs_enegy = stddevs["energy"]
+                    except Exception as e:
+                        # Not consistent data: W2, W3, W$
+                        print("[NOTE] Provided samples are not consistent!", e)
+                        means_energy  = None
+                        stddevs_enegy = None
+
 
                 ENERGY_FORCE = pack.atomistic.Atomwise(
                     n_in             = representation.n_atom_basis,
@@ -797,7 +838,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 else:                       self.model = torch.nn.DataParallel(self.model, device_ids=self._force_map, output_device=self._force_map[0])
         print_function(f"{self.internal_name} [model building] done.")
 
-    def build_trainer(self) -> None:
+    def build_trainer(self, weight:float = 1.0) -> None:
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
@@ -810,7 +851,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         ]
 
         # trainer
-        loss_fun = self.loss_fun_builder(self.training_properties, loss_tradeoff=self.loss_tradeoff)
+        loss_fun = self.loss_fun_builder(self.training_properties, loss_tradeoff=self.loss_tradeoff, weight=weight)
         self.trainer = Trainer(
             model_path        = self.model_path,
             model             = self.model,
@@ -857,11 +898,13 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         Main procedure of the training of neural network.
 
         """
-
-        for xyz_file in self.db_epochs:
+        for xyz_file in self.nn_settings:
             print_function(f"XYZ data: {xyz_file}")
-            for indexes, epochs in self.db_epochs[xyz_file].items():
-                print_function(f"Indexes: {indexes}")
+            #for indexes, epochs in self.nn_settings[xyz_file].items():
+            for indexes, epochs, *w in self.nn_settings[xyz_file][self._index_epoch_weight_key[xyz_file]]:
+                if len(w) == 0: w = self.nn_settings[xyz_file]['weight']
+                print_function(f"Indexes: '{indexes}' | epochs: {epochs} | weight: {w}")
+
                 self.prepare_databases(redo=False, index=indexes, xyz_file=xyz_file)
                 db_name = self._get_db_name(xyz_file=xyz_file, indexes=indexes)
                 self.prepare_train_valid_test_samples(db_name = db_name)
@@ -871,9 +914,8 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 # creating model instance: creating representation, output_modules for it
                 self.build_model()
                 self.print_info()
-
                 # initial preparations
-                if self._should_train: self.build_trainer()
+                if self._should_train: self.build_trainer(w)
                 #
                 self.name4storer = f"{self.network_name}_{db_name}.nn"
                 if not self.storer.get(self.name4storer): self.storer.put(what=0, name=self.name4storer)
@@ -1115,6 +1157,21 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         if "dipole_moment" in batch.keys(): a.set_internal_dipole_moment(batch['dipole_moment'].squeeze())
                         write(filename=f"{self.xyz_path}/outside_model{self.network_name}_threshold{self.downsample_threshold}_{str(outside_len)}.extxyz", images=a, format="extxyz", append=True)
 
+                # plot mean and std inside
+                try:    sysname = xyz_file.replace("_", " ")
+                except: sysname = "Downsampled data"
+                _idx, _energy = inside[:, 0], inside[:, 1]
+                _mean = np.mean(_energy)
+                _std  = np.std(_energy, ddof=1)
+                key_name = f"{key_prefix.replace('_', '')} on {sysname}: epochs:{str(epochs_done)} | predicted: {str(len(_idx))}" # TODO energy_error to smth better...
+                self.plotter_progress.plot(page="energy_loss_per_sample_inside", key_name=f"mean{_mean:.5f} | std:{_std:.5f} energy loss: {energy_error}", plotLine=False,
+                                           x=_idx, y= list(zip(
+                                               [_mean for _ in range(len(_idx))],
+                                               [_std  for _ in range(len(_idx))])),
+                                           errorStyle="fillvert",
+                                           )
+                self.plotter_progress.plot(page="energy_loss_per_sample_inside", key_name=key_name, plotLine=False,
+                                           x=_idx, y= _energy)
 
 
 
@@ -1182,7 +1239,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 db_path_fname = os.path.join(self.db_path, self._get_db_name(xyz_file=xyz_file, indexes=indexes))
                 print_function(f"Loading... | {db_path_fname}")
                 #
-                if xyz_file in self.db_epochs.keys():
+                if xyz_file in self.db_epochs:
                     subsamples_loader = AtomsLoader(self.train_samples, batch_size=1)
                     idxs = self.idx4vis
                     trained_subset = True
@@ -1239,10 +1296,12 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                         _energy_loss_per_sample = sorted_pred_energy[:,1] - sorted_orig_energy[:,1]
                         sorted_pred_energy[:, 0]
                         # plot mean and std
-                        self.plotter_progress.plot(page="energy_loss_per_sample", key_name = key_name+"mean", plotLine=False,
+                        _mean = np.mean(_energy_loss_per_sample)
+                        _std  = np.std(_energy_loss_per_sample, ddof=1)
+                        self.plotter_progress.plot(page="energy_loss_per_sample", key_name=f"mean{_mean:.5f}| std:{_std:.5f}", plotLine=False,
                                                    x=sorted_pred_energy[:,0], y= list(zip(
-                                                       [np.mean(_energy_loss_per_sample) for _ in range(len(sorted_pred_energy[:,0]))],
-                                                       [np.std(_energy_loss_per_sample, ddof=1) for _ in range(len(sorted_pred_energy[:,0]))])),
+                                                       [_mean for _ in range(len(sorted_pred_energy[:,0]))],
+                                                       [_std  for _ in range(len(sorted_pred_energy[:,0]))])),
                                                    errorStyle="fillvert",
                                                    )
                         self.plotter_progress.plot(page="energy_loss_per_sample", key_name = key_name,
