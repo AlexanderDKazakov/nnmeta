@@ -227,7 +227,7 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "2.0.0"
+    __version__                  : str            = "2.0.1"
     debug                        : bool           = False
     _should_train                : bool           = True
     _force_gpu                   : bool           = False
@@ -247,7 +247,6 @@ class NNClass:
     #
     db_properties                : tuple          = ("energy", "forces", "dipole_moment")  # properties look for database
     training_properties          : tuple          = ("energy", "forces", "dipole_moment")  # properties used for training
-    #db_epochs                    : dict           = field(default_factory=dict)
     nn_settings                  : dict           = field(default_factory=dict)
     training_progress            : dict           = field(default_factory=dict)
     loss_function_choice         : str            = "mse" # Available: ["mse", "mae", "sae", .?.]
@@ -335,7 +334,6 @@ class NNClass:
             print_function(f"Known NNs: {available_nns}")
             sys.exit(1)
 
-        #self.db_epochs = self.info[self.network_name]
         self.nn_settings = self.info[self.network_name]
 
         if self.info[kf].get("_should_train")              is not None: self._should_train               = self.info[kf].get("_should_train")
@@ -546,7 +544,6 @@ class NNClass:
             {self.nn_settings}
 
         """)
-            #[INDEXES : EPOCHS]          :   {self.db_epochs.items()}
         self.storer.show()
 
     def create_model_path(self, redo:bool = False) -> None:
@@ -1239,7 +1236,7 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
                 db_path_fname = os.path.join(self.db_path, self._get_db_name(xyz_file=xyz_file, indexes=indexes))
                 print_function(f"Loading... | {db_path_fname}")
                 #
-                if xyz_file in self.db_epochs:
+                if xyz_file in self.nn_settings.keys():
                     subsamples_loader = AtomsLoader(self.train_samples, batch_size=1)
                     idxs = self.idx4vis
                     trained_subset = True
