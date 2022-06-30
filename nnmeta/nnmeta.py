@@ -227,7 +227,7 @@ class GPUInfo:
 
 @dataclass
 class NNClass:
-    __version__                  : str            = "2.0.1"
+    __version__                  : str            = "2.0.2"
     debug                        : bool           = False
     _should_train                : bool           = True
     _force_gpu                   : bool           = False
@@ -264,7 +264,7 @@ class NNClass:
     n_filters                    : int            = 128
     n_gaussians                  : int            = 25
     n_interactions               : int            = 1
-    cutoff                       : int            = 5.0  # angstroms
+    cutoff                       : float          = 5.0  # angstroms
 
     n_layers_energy_force        : int            = 2
     n_layers_dipole_moment       : int            = 2
@@ -516,6 +516,8 @@ class NNClass:
             return f"{xyz_file}_{str(indexes)}_{self.units['ENERGY'].replace('/','')}_{self.units['FORCE'].replace('/','')}_{self.units['DIPOLE_MOMENT'].replace('/','')}.db"
 
     def print_info(self) -> None:
+        gap="            "
+        new_line="\n" + gap # \escape is not allowed in fstings
         print_function(f"""
 # # # # # # # # # # # [INFORMATION [{self.network_name}] | device {self.device.type} | GPU idx: {self.gpu_info.get_gpu_in_use()}] # # # # # # # # # # #
         NUMBER TRAINING EXAMPLES  [%]/# :   {self.train_samples_percent}/{self._number_train_samples}
@@ -541,8 +543,7 @@ class NNClass:
             SPLITS                      :   {self.split_path}
 
         NN SETTINGS:
-            {self.nn_settings}
-
+            {new_line.join(f"{key:<30}: {value}" for key, value in self.nn_settings.items())}
         """)
         self.storer.show()
 
@@ -591,11 +592,13 @@ class NNClass:
         time = results[:,0]-results[0,0]
         time_ = self.training_progress['time'] - self.training_progress['time'][0]
 
-        # Load the validation MAEs
-        if 'energy'                  in self.training_properties: energy_loss        = self.training_progress['energy']
-        if 'forces'                  in self.training_properties: forces_loss        = self.training_progress['forces']
-        if 'dipole_moment'           in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment']
-        if "dipole_moment_magnitude" in self.training_properties: dipole_moment_loss = self.training_progress['dipole_moment_magnitude']
+        # Load the validation
+        # 1. mae [energy, force,]
+        # 2. mse
+        if 'energy'                  in self.training_properties: energy_loss        = self.training_progress[[k for k in self.training_progress.keys() if "energy" in k][0]]
+        if 'forces'                  in self.training_properties: forces_loss        = self.training_progress[[k for k in self.training_progress.keys() if "forces" in k][0]]
+        if 'dipole_moment'           in self.training_properties: dipole_moment_loss = self.training_progress[[k for k in self.training_progress.keys() if "dipole_moment" in k][0]]
+        if "dipole_moment_magnitude" in self.training_properties: dipole_moment_loss = self.training_progress[[k for k in self.training_progress.keys() if "dipole_moment_magnitude" in k][0]]
 
 
         # Get final validation errors
@@ -840,11 +843,13 @@ Validation LOSS | epochs {self.storer.get(self.name4storer)}:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
         # construct hooks # MeanSquaredError OR# RootMeanSquaredError
-        metrics = [MeanAbsoluteError(p, p) if p != "forces" else MeanAbsoluteError(p, p, element_wise=True) for p in self.training_properties]
+        #metrics = [MeanAbsoluteError(p, p) if p != "forces" else MeanAbsoluteError(p, p, element_wise=True) for p in self.training_properties]
+        metrics = [MeanSquaredError(p, p) if p != "forces" else MeanSquaredError(p, p, element_wise=True) for p in self.training_properties]
+        #metrics = [RootMeanSquaredError(p, p) if p != "forces" else RootMeanSquaredError(p, p, element_wise=True) for p in self.training_properties]
 
         hooks   = [
             CSVHook(log_path=self.model_path, metrics=metrics),
-            ReduceLROnPlateauHook(optimizer, patience=15, factor=0.8, min_lr=1e-8, stop_after_min=True)
+            ReduceLROnPlateauHook(optimizer, patience=15, factor=0.9, min_lr=1e-6, stop_after_min=True)
         ]
 
         # trainer
